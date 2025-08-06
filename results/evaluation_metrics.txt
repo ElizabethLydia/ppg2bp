@@ -1,20 +1,19 @@
-血压预测模型评估报告
-====================
-评估样本数: 5
+=== EVALUATION SUMMARY ===
+Metrics averaged over 5 random test samples.
 
 损失函数分解 (平均值):
-  - total: 9.5609
-  - mse: 485.3859
-  - trend: 0.6577
-  - cosine_trend: 0.6577
+  - total: 10.0301
+  - mse: 408.2598
+  - trend: 0.2957
+  - cosine_trend: 0.2957
   - corr_trend: 0.0000
-  - grad_trend: 8.9350
+  - grad_trend: 11.8360
 
 性能指标 (平均值):
-  - MAE: 18.5035
-  - MSE: 485.3859
-  - RMSE: 21.2918
-  - R2: -1.5358
-  - Correlation: 0.3423
-  - Cosine_Similarity: 0.3423
-  - Direction_Consistency: 0.0645
+  - MAE: 16.2872
+  - MSE: 408.2598
+  - RMSE: 18.6952
+  - R2: -0.5281
+  - Correlation: 0.7043
+  - Cosine_Similarity: 0.7043
+  - Direction_Consistency: 0.3751

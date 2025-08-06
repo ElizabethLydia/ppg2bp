@@ -83,7 +83,7 @@ def organize_raw_data(source_base_dir, dest_dir, subjects_to_process):
              print(f"Organized data for {subject_id}")
 
 def butter_bandpass_filter(data, lowcut, highcut, fs, order=4):
-    if len(data) < order * 3:  # 数据太短，不滤波
+    if len(data) < order * 3: 
         print(f"Warning: Data too short for filtering ({len(data)} points), skipping filter")
         return data
     
