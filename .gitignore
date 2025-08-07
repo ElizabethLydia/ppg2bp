@@ -1,1 +1,6 @@
 saved_models/*.pth
+data/processed/
+data/raw/
+debug.py
+__pycache__/
+*.py[cod]
