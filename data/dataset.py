@@ -1,72 +1,103 @@
-import sys
 import os
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, project_root)
-
-import torch
 import numpy as np
+import torch
 from torch.utils.data import Dataset
 
 class PPGDataset(Dataset):
-    def __init__(self, npz_path):
-        try:
-            data = np.load(npz_path)
-            self.ppg_data = data['ppg']
-            self.bp_data = data['bp']
-            
-            if 'sensor_mask' in data:
-                self.sensor_mask = data['sensor_mask']
-                print(f"Loaded dataset with sensor masks. Shape: {self.sensor_mask.shape}")
-            else:
-                print("No sensor masks found, assuming all sensors are available")
-                self.sensor_mask = np.ones((len(self.ppg_data), self.ppg_data.shape[1]), dtype=bool)
-            
-            if len(self.ppg_data) == 0 or len(self.bp_data) == 0:
-                raise ValueError("Empty dataset loaded")
-                
-            if len(self.ppg_data) != len(self.bp_data):
-                min_len = min(len(self.ppg_data), len(self.bp_data))
-                self.ppg_data = self.ppg_data[:min_len]
-                self.bp_data = self.bp_data[:min_len]
-                self.sensor_mask = self.sensor_mask[:min_len]
-                print(f"Warning: Mismatched lengths, truncated to {min_len}")
-                
-        except FileNotFoundError:
-            print(f"Error: Data file not found at {npz_path}")
-            print("Please run data/generate_dataset.py first.")
-            self.ppg_data = np.array([])
-            self.bp_data = np.array([])
-            self.sensor_mask = np.array([])
-        except Exception as e:
-            print(f"Error loading dataset: {e}")
-            self.ppg_data = np.array([])
-            self.bp_data = np.array([])
-            self.sensor_mask = np.array([])
+    def __init__(self, npz_path: str, mmap: bool = True, make_contiguous: bool = True):
+        self.ppg_data = torch.empty(0)
+        self.bp_data = torch.empty(0)
+        self.sensor_mask = torch.empty(0, dtype=torch.bool)
 
-        if len(self.ppg_data) > 0:
-            self.ppg_data = torch.from_numpy(self.ppg_data).float()
-            self.bp_data = torch.from_numpy(self.bp_data).float()
-            self.sensor_mask = torch.from_numpy(self.sensor_mask).bool()
-            
-            if self.bp_data.ndim == 2:
-                self.bp_data = self.bp_data.unsqueeze(1)
-            elif self.bp_data.ndim == 1:
-                self.bp_data = self.bp_data.unsqueeze(0).unsqueeze(0)
+        if not os.path.exists(npz_path):
+            print(f"[PPGDataset] Error: file not found -> {npz_path}")
+            return
+
+        try:
+            # 关键：用上下文管理器，读完立刻关闭文件句柄，避免多进程卡死
+            with np.load(npz_path, mmap_mode=('r' if mmap else None)) as store:
+                if 'ppg' not in store.files or 'bp' not in store.files:
+                    raise ValueError(f"NPZ missing required arrays 'ppg' or 'bp'. Found: {store.files}")
+
+                ppg = store['ppg']       # 期望形状 (N, C, L)
+                bp = store['bp']         # 期望形状 (N, L) 或 (N, 1, L)
+
+                if 'sensor_mask' in store.files:
+                    sensor_mask = store['sensor_mask']  # 期望形状 (N, C)
+                else:
+                    sensor_mask = None
+
+            # ----------- 基本一致性处理 -----------
+            N = min(len(ppg), len(bp))
+            if N == 0:
+                print("[PPGDataset] Error: empty arrays in NPZ.")
+                return
+
+            ppg = ppg[:N]
+            bp = bp[:N]
+            # ppg: (N, C, L)
+            if ppg.ndim != 3:
+                raise ValueError(f"ppg array must be 3D (N,C,L), got shape {ppg.shape}")
+
+            N, C, L = ppg.shape
+
+            # bp: 统一到 (N, 1, L)
+            if bp.ndim == 2:         # (N, L)
+                if bp.shape[1] != L:
+                    raise ValueError(f"bp length mismatch: bp.shape[1]={bp.shape[1]} vs L={L}")
+                bp = bp[:, None, :]  # -> (N, 1, L)
+            elif bp.ndim == 3:       # (N, 1, L) or (N, ?, L)
+                if bp.shape[-1] != L:
+                    raise ValueError(f"bp length mismatch: bp.shape[-1]={bp.shape[-1]} vs L={L}")
+                if bp.shape[1] != 1:
+                    # 如果是 (N, K, L) 意味着有多个通道，保留第一个
+                    bp = bp[:, :1, :]
+            else:
+                raise ValueError(f"bp array must be 2D or 3D, got shape {bp.shape}")
+
+            # sensor_mask: 统一到 (N, C)
+            if sensor_mask is None:
+                sensor_mask = np.ones((N, C), dtype=bool)
+            else:
+                if sensor_mask.ndim != 2 or sensor_mask.shape[0] != N:
+                    # 对齐 N
+                    sensor_mask = sensor_mask[:N]
+                if sensor_mask.shape[1] != C:
+                    # 如果 mask 通道数不匹配，尝试广播或截断
+                    new_mask = np.ones((N, C), dtype=bool)
+                    min_c = min(C, sensor_mask.shape[1])
+                    new_mask[:, :min_c] = sensor_mask[:, :min_c].astype(bool)
+                    sensor_mask = new_mask
+
+            # ----------- 转成 torch.Tensor -----------
+            # 可选：先复制为常规内存数组，避免 memmap 在多进程下的开销
+            if make_contiguous:
+                ppg = np.ascontiguousarray(ppg)
+                bp = np.ascontiguousarray(bp)
+                sensor_mask = np.ascontiguousarray(sensor_mask)
+
+            self.ppg_data = torch.from_numpy(ppg).float()                 # (N, C, L)
+            self.bp_data = torch.from_numpy(bp).float()                   # (N, 1, L)
+            self.sensor_mask = torch.from_numpy(sensor_mask).bool()       # (N, C)
+
+        except Exception as e:
+            print(f"[PPGDataset] Error loading dataset: {e}")
+            # 留空，__len__ 会返回 0
 
     def __len__(self):
-        return len(self.ppg_data) if len(self.ppg_data) > 0 else 0
+        return int(self.ppg_data.shape[0]) if self.ppg_data.ndim == 3 else 0
 
-    def __getitem__(self, idx):
-        if idx >= len(self):
-            raise IndexError("Index out of dataset range")
-            
-        ppg_sample = self.ppg_data[idx]
-        bp_sample = self.bp_data[idx]
-        mask_sample = self.sensor_mask[idx]
-        
-        if torch.isnan(ppg_sample).any() or torch.isnan(bp_sample).any():
-            print(f"Warning: NaN values found in sample {idx}")
-            ppg_sample = torch.nan_to_num(ppg_sample)
-            bp_sample = torch.nan_to_num(bp_sample)
-        
-        return ppg_sample, bp_sample, mask_sample
+    def __getitem__(self, idx: int):
+        if idx < 0 or idx >= len(self):
+            raise IndexError("Index out of range")
+        ppg = self.ppg_data[idx]            # (C, L)
+        bp = self.bp_data[idx]              # (1, L)
+        mask = self.sensor_mask[idx]        # (C,)
+
+        # 简单的 NaN 保护（如需）
+        if torch.isnan(ppg).any():
+            ppg = torch.nan_to_num(ppg)
+        if torch.isnan(bp).any():
+            bp = torch.nan_to_num(bp)
+
+        return ppg, bp, mask

@@ -4,20 +4,22 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 import os
+import swanlab
 import numpy as np
 import config
 from data.dataset import PPGDataset
 from model.model import UNet1D
-from loss.trend_loss import TrendLoss
+# --- MODIFICATION: Import the new attention-based loss function ---
+from loss.trend_loss import CombinedBPAttentionLoss
 
 def train_one_epoch(model, dataloader, criterion, optimizer, device):
     model.train()
-    running_loss = 0.0
-    running_mse_loss = 0.0
+    
+    # --- MODIFICATION: Update running totals for new loss components ---
+    running_total_loss = 0.0
+    running_sbp_dbp_loss = 0.0
     running_trend_loss = 0.0
-    running_cosine_trend = 0.0
-    running_corr_trend = 0.0
-    running_grad_trend = 0.0
+    running_notch_loss = 0.0
     
     for batch_data in tqdm(dataloader, desc="Training"):
         if len(batch_data) == 3:
@@ -32,7 +34,8 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device):
         
         predictions = model(ppg, sensor_mask)
         
-        loss, mse_loss, trend_loss, loss_details = criterion(predictions, bp)
+        # --- MODIFICATION: Unpack new loss and details dictionary ---
+        loss, loss_details = criterion(predictions, bp)
         
         if torch.isnan(loss) or torch.isinf(loss):
             print("Warning: NaN or Inf loss detected, skipping batch")
@@ -42,83 +45,84 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         
+        # --- MODIFICATION: Accumulate new loss components ---
         batch_size = ppg.size(0)
-        running_loss += loss.item() * batch_size
-        running_mse_loss += mse_loss.item() * batch_size
-        running_trend_loss += trend_loss.item() * batch_size
-        running_cosine_trend += loss_details['cosine_trend'].item() * batch_size
-        running_corr_trend += loss_details['corr_trend'].item() * batch_size
-        running_grad_trend += loss_details['grad_trend'].item() * batch_size
+        running_total_loss += loss.item() * batch_size
+        running_sbp_dbp_loss += loss_details['sbp_dbp_loss'] * batch_size
+        running_trend_loss += loss_details['trend_loss'] * batch_size
+        running_notch_loss += loss_details['notch_loss'] * batch_size
         
     dataset_size = len(dataloader.dataset)
-    epoch_loss = running_loss / dataset_size
-    epoch_mse_loss = running_mse_loss / dataset_size
-    epoch_trend_loss = running_trend_loss / dataset_size
-    epoch_cosine_trend = running_cosine_trend / dataset_size
-    epoch_corr_trend = running_corr_trend / dataset_size
-    epoch_grad_trend = running_grad_trend / dataset_size
     
+    # --- MODIFICATION: Return dictionary with new metrics ---
     return {
-        'total_loss': epoch_loss,
-        'mse_loss': epoch_mse_loss,
-        'trend_loss': epoch_trend_loss,
-        'cosine_trend': epoch_cosine_trend,
-        'corr_trend': epoch_corr_trend,
-        'grad_trend': epoch_grad_trend
+        'total_loss': running_total_loss / dataset_size,
+        'sbp_dbp_loss': running_sbp_dbp_loss / dataset_size,
+        'trend_loss': running_trend_loss / dataset_size,
+        'notch_loss': running_notch_loss / dataset_size
     }
 
 def validate_one_epoch(model, dataloader, criterion, device):
     model.eval()
-    running_loss = 0.0
-    running_mse_loss = 0.0
+
+    # --- MODIFICATION: Update running totals for new loss components ---
+    running_total_loss = 0.0
+    running_sbp_dbp_loss = 0.0
     running_trend_loss = 0.0
-    running_cosine_trend = 0.0
-    running_corr_trend = 0.0
-    running_grad_trend = 0.0
+    running_notch_loss = 0.0
     
     with torch.no_grad():
         for batch_data in tqdm(dataloader, desc="Validating"):
-            if len(batch_data) == 3:  # 新格式：ppg, bp, mask
+            if len(batch_data) == 3:
                 ppg, bp, sensor_mask = batch_data
                 ppg, bp, sensor_mask = ppg.to(device), bp.to(device), sensor_mask.to(device)
-            else:  # 旧格式：ppg, bp
+            else:
                 ppg, bp = batch_data
                 ppg, bp = ppg.to(device), bp.to(device)
                 sensor_mask = None
                 
             predictions = model(ppg, sensor_mask)
-            loss, mse_loss, trend_loss, loss_details = criterion(predictions, bp)
+            
+            # --- MODIFICATION: Unpack new loss and details dictionary ---
+            loss, loss_details = criterion(predictions, bp)
             
             if not torch.isnan(loss) and not torch.isinf(loss):
+                # --- MODIFICATION: Accumulate new loss components ---
                 batch_size = ppg.size(0)
-                running_loss += loss.item() * batch_size
-                running_mse_loss += mse_loss.item() * batch_size
-                running_trend_loss += trend_loss.item() * batch_size
-                running_cosine_trend += loss_details['cosine_trend'].item() * batch_size
-                running_corr_trend += loss_details['corr_trend'].item() * batch_size
-                running_grad_trend += loss_details['grad_trend'].item() * batch_size
-    
-    dataset_size = len(dataloader.dataset)
-    epoch_loss = running_loss / dataset_size
-    epoch_mse_loss = running_mse_loss / dataset_size
-    epoch_trend_loss = running_trend_loss / dataset_size
-    epoch_cosine_trend = running_cosine_trend / dataset_size
-    epoch_corr_trend = running_corr_trend / dataset_size
-    epoch_grad_trend = running_grad_trend / dataset_size
+                running_total_loss += loss.item() * batch_size
+                running_sbp_dbp_loss += loss_details['sbp_dbp_loss'] * batch_size
+                running_trend_loss += loss_details['trend_loss'] * batch_size
+                running_notch_loss += loss_details['notch_loss'] * batch_size
 
+    dataset_size = len(dataloader.dataset)
+    
+    # --- MODIFICATION: Return dictionary with new metrics ---
     return {
-        'total_loss': epoch_loss,
-        'mse_loss': epoch_mse_loss,
-        'trend_loss': epoch_trend_loss,
-        'cosine_trend': epoch_cosine_trend,
-        'corr_trend': epoch_corr_trend,
-        'grad_trend': epoch_grad_trend
+        'total_loss': running_total_loss / dataset_size,
+        'sbp_dbp_loss': running_sbp_dbp_loss / dataset_size,
+        'trend_loss': running_trend_loss / dataset_size,
+        'notch_loss': running_notch_loss / dataset_size
     }
 
 def main():
+    swanlab.init(
+    project="ppg2bp-train",
+    name="unet1d-bp-loss-seg1*",
+    config={
+        "epochs": config.NUM_EPOCHS,
+        "batch_size": config.BATCH_SIZE,
+        "learning_rate": config.LEARNING_RATE,
+        "dropout": 0.2,
+        "loss_weights": {
+            "sbp_dbp": 0.4,
+            "trend": 0.4,
+            "notch": 0.2
+            }
+        }
+    )
     print("Loading datasets...")
-    train_dataset = PPGDataset(os.path.join(config.PROCESSED_DATA_DIR, "train_data.npz"))
-    val_dataset = PPGDataset(os.path.join(config.PROCESSED_DATA_DIR, "validation_data.npz"))
+    train_dataset = PPGDataset(os.path.join(config.PROCESSED_DATA_DIR, "train_seg1_data.npz"))
+    val_dataset = PPGDataset(os.path.join(config.PROCESSED_DATA_DIR, "validation_seg1_data.npz"))
     
     if len(train_dataset) == 0 or len(val_dataset) == 0:
         print("Error: Train or validation dataset is empty.")
@@ -133,11 +137,16 @@ def main():
     print(f"Initializing model on device: {config.DEVICE}")
     model = UNet1D(in_channels=config.IN_CHANNELS, output_points=config.OUTPUT_POINTS, dropout_rate=0.2).to(config.DEVICE)
     
-    criterion = TrendLoss(mse_weight=0.01, trend_weight=0.5, grad_weight=0.49)
-    print("Using enhanced TrendLoss with weights - MSE:1%, Trend:50%, Grad:49%")
+    # --- MODIFICATION: Initialize the new CombinedBPAttentionLoss ---
+    criterion = CombinedBPAttentionLoss(
+        sbp_dbp_weight=0.4, 
+        trend_weight=0.4, 
+        notch_weight=0.2
+    )
+    print("Using CombinedBPAttentionLoss with weights - SBP/DBP: 40%, Trend: 40%, Notch: 20%")
     
     optimizer = optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=1e-2)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
     best_val_loss = float('inf')
     epochs_no_improve = 0
@@ -157,10 +166,24 @@ def main():
         train_metrics_history.append(train_metrics)
         val_metrics_history.append(val_metrics)
         
-        print(f"  TRAIN -> Total: {train_metrics['total_loss']:.4f} | MSE: {train_metrics['mse_loss']:.4f} | Trend: {train_metrics['trend_loss']:.4f} | Grad: {train_metrics['grad_trend']:.4f}")
-        print(f"  VALID -> Total: {val_metrics['total_loss']:.4f} | MSE: {val_metrics['mse_loss']:.4f} | Trend: {val_metrics['trend_loss']:.4f} | Grad: {val_metrics['grad_trend']:.4f}")
+        # --- MODIFICATION: Update print statements for new metrics ---
+        print(f"  TRAIN -> Total: {train_metrics['total_loss']:.4f} | SBP/DBP: {train_metrics['sbp_dbp_loss']:.4f} | Trend: {train_metrics['trend_loss']:.4f} | Notch: {train_metrics['notch_loss']:.4f}")
+        print(f"  VALID -> Total: {val_metrics['total_loss']:.4f} | SBP/DBP: {val_metrics['sbp_dbp_loss']:.4f} | Trend: {val_metrics['trend_loss']:.4f} | Notch: {val_metrics['notch_loss']:.4f}")
         print(f"  Learning Rate: {optimizer.param_groups[0]['lr']:.6f}")
         
+        swanlab.log({
+            "epoch": epoch + 1,
+            "train/total_loss": train_metrics['total_loss'],
+            "train/sbp_dbp_loss": train_metrics['sbp_dbp_loss'],
+            "train/trend_loss": train_metrics['trend_loss'],
+            "train/notch_loss": train_metrics['notch_loss'],
+            "val/total_loss": val_metrics['total_loss'],
+            "val/sbp_dbp_loss": val_metrics['sbp_dbp_loss'],
+            "val/trend_loss": val_metrics['trend_loss'],
+            "val/notch_loss": val_metrics['notch_loss'],
+            "lr": optimizer.param_groups[0]['lr'],
+        })
+
         val_loss = val_metrics['total_loss']
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -172,6 +195,18 @@ def main():
         else:
             epochs_no_improve += 1
             print(f"  No improvement. Early stopping counter: {epochs_no_improve}/{config.PATIENCE}")
+
+        # NEW: Save model at every 5th epoch (5, 10, 15, 20, etc.)
+        if (epoch + 1) % 5 == 0:
+            os.makedirs("saved_models", exist_ok=True)
+            epoch_model_path = os.path.join("saved_models", f"model_epoch_{epoch+1}.pth")
+            torch.save({
+                'epoch': epoch, 
+                'model_state_dict': model.state_dict(), 
+                'val_loss': val_loss,
+                'train_loss': train_metrics['total_loss']
+            }, epoch_model_path)
+            print(f"  Saved epoch {epoch+1} model to {epoch_model_path}")
         
         if epochs_no_improve >= config.PATIENCE:
             print(f"No improvement for {config.PATIENCE} consecutive epochs. Stopping early.")
@@ -180,73 +215,57 @@ def main():
     print("Training Finished")
     print(f"Best validation loss achieved: {best_val_loss:.6f}")
 
-    # --- 绘图部分 ---
+    # --- Visualization section ---
     print("Plotting and saving learning curves...")
     try:
         import matplotlib.pyplot as plt
         
         epochs = range(1, len(train_metrics_history) + 1)
-        train_total_losses = [m['total_loss'] for m in train_metrics_history]
-        val_total_losses = [m['total_loss'] for m in val_metrics_history]
         
-        # 图一：总损失曲线 (保持不变)
+        # Plot 1: Total Loss Curve (remains the same)
         plt.figure(figsize=(12, 6))
-        plt.plot(epochs, train_total_losses, label='Training Total Loss')
-        plt.plot(epochs, val_total_losses, label='Validation Total Loss')
+        plt.plot(epochs, [m['total_loss'] for m in train_metrics_history], label='Training Total Loss')
+        plt.plot(epochs, [m['total_loss'] for m in val_metrics_history], label='Validation Total Loss')
         plt.title('Training & Validation Total Loss Curve')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        if val_total_losses:
-            best_epoch = np.argmin(val_total_losses) + 1
+        plt.xlabel('Epoch'); plt.ylabel('Loss')
+        if val_metrics_history:
+            best_epoch = np.argmin([m['total_loss'] for m in val_metrics_history]) + 1
             plt.axvline(best_epoch, color='r', linestyle='--', alpha=0.7, label=f'Best Val Loss (Epoch {best_epoch})')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
+        plt.legend(); plt.grid(True, alpha=0.3)
         os.makedirs("results", exist_ok=True)
-        plot_path = os.path.join("results", "loss_curve.png")
-        plt.savefig(plot_path, dpi=300)
-        print(f"Total loss curve saved to {plot_path}")
+        plt.savefig(os.path.join("results", "loss_curve.png"), dpi=300)
         plt.close()
+        print("Total loss curve saved.")
 
-        # --- 【核心修改】图二：将所有损失分解项绘制在一张图上 ---
+        # --- MODIFICATION: Plot 2 visualizes the new loss components ---
         plt.figure(figsize=(14, 8))
         
-        # 提取各分项损失
-        train_mse = [m['mse_loss'] for m in train_metrics_history]
-        val_mse = [m['mse_loss'] for m in val_metrics_history]
-        train_trend = [m['trend_loss'] for m in train_metrics_history]
-        val_trend = [m['trend_loss'] for m in val_metrics_history]
-        train_grad = [m['grad_trend'] for m in train_metrics_history]
-        val_grad = [m['grad_trend'] for m in val_metrics_history]
-
-        # 使用不同的颜色和线型绘制所有曲线
-        plt.plot(epochs, train_mse, label='Train MSE Loss', color='blue', linestyle='-')
-        plt.plot(epochs, val_mse, label='Validation MSE Loss', color='blue', linestyle='--')
+        # SBP/DBP Loss
+        plt.plot(epochs, [m['sbp_dbp_loss'] for m in train_metrics_history], label='Train SBP/DBP Loss', color='blue', linestyle='-')
+        plt.plot(epochs, [m['sbp_dbp_loss'] for m in val_metrics_history], label='Validation SBP/DBP Loss', color='blue', linestyle='--')
         
-        plt.plot(epochs, train_trend, label='Train Trend Loss', color='green', linestyle='-')
-        plt.plot(epochs, val_trend, label='Validation Trend Loss', color='green', linestyle='--')
+        # Trend Loss
+        plt.plot(epochs, [m['trend_loss'] for m in train_metrics_history], label='Train Trend Loss', color='green', linestyle='-')
+        plt.plot(epochs, [m['trend_loss'] for m in val_metrics_history], label='Validation Trend Loss', color='green', linestyle='--')
         
-        plt.plot(epochs, train_grad, label='Train Grad Loss', color='red', linestyle='-')
-        plt.plot(epochs, val_grad, label='Validation Grad Loss', color='red', linestyle='--')
+        # Notch Loss
+        plt.plot(epochs, [m['notch_loss'] for m in train_metrics_history], label='Train Notch Loss', color='red', linestyle='-')
+        plt.plot(epochs, [m['notch_loss'] for m in val_metrics_history], label='Validation Notch Loss', color='red', linestyle='--')
         
         plt.title('All Loss Components Over Epochs')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss Value')
-        plt.legend(loc='upper right')
-        plt.grid(True, alpha=0.5)
-        # 建议使用对数坐标轴，因为MSE和其他损失的量级可能差异巨大
+        plt.xlabel('Epoch'); plt.ylabel('Loss Value')
+        plt.legend(loc='upper right'); plt.grid(True, alpha=0.5)
         plt.yscale('log')
         plt.suptitle('Note: Y-axis is in log scale to show all components clearly', fontsize=10, y=0.92)
 
-        components_plot_path = os.path.join("results", "loss_components_curve.png")
-        plt.savefig(components_plot_path, dpi=300)
-        print(f"Loss components curve saved to {components_plot_path}")
+        plt.savefig(os.path.join("results", "loss_components_curve.png"), dpi=300)
         plt.close()
+        print("Loss components curve saved.")
 
     except ImportError:
         print("Matplotlib not found. Skipping plot generation.")
     except Exception as e:
         print(f"An error occurred during plotting: {e}")
-
 
 if __name__ == "__main__":
     main()

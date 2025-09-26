@@ -4,3 +4,7 @@ data/raw/
 debug.py
 __pycache__/
 *.py[cod]
+saved_models/
+swanlog/  
+bp_calibration.log   
+processing.log

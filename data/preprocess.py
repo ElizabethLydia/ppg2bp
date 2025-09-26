@@ -309,6 +309,8 @@ def load_biopac_bp_values(subject_folder, segment):
             df_sbp.columns = ['timestamp', 'sbp']
             df_sbp['sbp'] = pd.to_numeric(df_sbp['sbp'], errors='coerce')
             df_sbp.dropna(inplace=True)
+            # Filter out zero values
+            df_sbp = df_sbp[df_sbp['sbp'] != 0]
             sbp_mean = df_sbp['sbp'].mean() if not df_sbp.empty else None
         else:
             logging.debug(f"Systolic BP file not found: {systolic_path}")
@@ -320,13 +322,15 @@ def load_biopac_bp_values(subject_folder, segment):
             df_dbp.columns = ['timestamp', 'dbp']
             df_dbp['dbp'] = pd.to_numeric(df_dbp['dbp'], errors='coerce')
             df_dbp.dropna(inplace=True)
+            # Filter out zero values
+            df_dbp = df_dbp[df_dbp['dbp'] != 0]
             dbp_mean = df_dbp['dbp'].mean() if not df_dbp.empty else None
         else:
             logging.debug(f"Diastolic BP file not found: {diastolic_path}")
             dbp_mean = None
             
         if sbp_mean is not None and dbp_mean is not None:
-            logging.debug(f"Biopac BP values for {segment}: SBP={sbp_mean:.1f}, DBP={dbp_mean:.1f}")
+            logging.debug(f"Biopac BP values for {segment}: SBP={sbp_mean:.1f}, DBP={dbp_mean:.1f} (zeros excluded)")
         
         return sbp_mean, dbp_mean
         
@@ -334,50 +338,97 @@ def load_biopac_bp_values(subject_folder, segment):
         logging.error(f"Error loading Biopac BP values: {e}")
         return None, None
 
-def apply_bp_calibration(bp_data, subject_id, segment):
+def calculate_bp_shift_amount(subject_id):
     """
-    Apply BP calibration based on Omron and Biopac differences
+    Calculate BP shift amount based on seg1 Omron vs Biopac comparison
     
     Args:
-        bp_data: BP waveform data
         subject_id: Subject ID (e.g., '00042')
-        segment: Segment name (e.g., 'seg1')
     
     Returns:
-        Calibrated BP data and shift amount (for printing)
+        avg_diff: Average shift amount in mmHg, or None if calculation fails
     """
     # Load all Omron data
     omron_data = load_omron_data()
     
-    # Look up this subject and segment
-    omron_key = f"{subject_id}_{segment}"
+    # Look up seg1 data for this subject
+    omron_key = f"{subject_id}_seg1"
     if omron_key not in omron_data:
-        logging.debug(f"No Omron data for {subject_id} {segment}")
-        return bp_data, None
+        logging.debug(f"No Omron data for {subject_id} seg1")
+        return None
     
     omron_sbp, omron_dbp = omron_data[omron_key]
     
-    # Load Biopac SBP/DBP
+    # Load Biopac SBP/DBP for seg1
     subject_folder = os.path.join(config.RAW_DATA_DIR, subject_id)
-    biopac_sbp, biopac_dbp = load_biopac_bp_values(subject_folder, segment)
+    biopac_sbp, biopac_dbp = load_biopac_bp_values(subject_folder, 'seg1')
     
     if biopac_sbp is None or biopac_dbp is None:
-        logging.debug(f"No Biopac SBP/DBP data for {subject_id} {segment}")
-        return bp_data, None
+        logging.debug(f"No Biopac SBP/DBP data for {subject_id} seg1")
+        return None
     
     # Calculate differences
     sbp_diff = omron_sbp - biopac_sbp
     dbp_diff = omron_dbp - biopac_dbp
     avg_diff = (sbp_diff + dbp_diff) / 2
     
-    # Apply shift if difference is reasonable (within ±10 mmHg)
+    # Return shift amount if difference is reasonable (within ±10 mmHg)
     if abs(sbp_diff - dbp_diff) <= 10:
-        calibrated_bp = bp_data + avg_diff
-        print(f"segment {segment}: BP waveform shifted by {avg_diff:+.1f} mmHg")
-        return calibrated_bp, avg_diff
+        logging.debug(f"Calculated shift amount for {subject_id}: {avg_diff:+.1f} mmHg")
+        return avg_diff
     else:
-        print(f"segment {segment}: No shift applied, delta too large ({sbp_diff - dbp_diff:.1f} mmHg)")
+        logging.debug(f"No shift for {subject_id}, delta too large ({sbp_diff - dbp_diff:.1f} mmHg)")
+        return None
+
+def apply_bp_calibration(bp_data, subject_id, segment, shift_amount=None):
+    """
+    Apply BP calibration using pre-calculated shift amount
+    
+    Args:
+        bp_data: BP waveform data
+        subject_id: Subject ID (e.g., '00042')
+        segment: Segment name (e.g., 'seg1' or 'seg7')
+        shift_amount: Pre-calculated shift amount, or None to calculate from seg1
+    
+    Returns:
+        Calibrated BP data and shift amount (for printing)
+    """
+    # If shift_amount is not provided, calculate it from seg1
+    if shift_amount is None:
+        shift_amount = calculate_bp_shift_amount(subject_id)
+    
+    if shift_amount is not None:
+        calibrated_bp = bp_data + shift_amount
+        print(f"segment {segment}: BP waveform shifted by {shift_amount:+.1f} mmHg")
+        return calibrated_bp, shift_amount
+    else:
+        print(f"segment {segment}: No shift applied")
         return bp_data, None
+
+def save_calibrated_bp(bp_data, original_timestamps, subject_id, segment, moved_data_dir):
+    """
+    Save calibrated BP data to moved directory in original CSV format
+    
+    Args:
+        bp_data: Calibrated BP waveform data
+        original_timestamps: Original timestamps from raw data
+        subject_id: Subject ID (e.g., '00042')
+        segment: Segment name (e.g., 'seg1')
+        moved_data_dir: Base directory for moved data
+    """
+    # Create subject directory if not exists
+    subject_moved_dir = os.path.join(moved_data_dir, subject_id)
+    os.makedirs(subject_moved_dir, exist_ok=True)
+    
+    # Save to CSV with exact same format as original
+    moved_bp_path = os.path.join(subject_moved_dir, f'{segment}_bp.csv')
+    
+    with open(moved_bp_path, 'w') as f:
+        for timestamp, bp_value in zip(original_timestamps, bp_data):
+            # Format to match original: preserve timestamp precision, round BP to 4 decimal places
+            f.write(f"{timestamp:.7f},{bp_value:.4f}\n")
+    
+    logging.debug(f"Saved calibrated BP data to: {moved_bp_path}")
 
 def find_bp_valleys(bp_data, fs, avg_hr=None):
     """
@@ -507,7 +558,7 @@ def find_bp_valleys(bp_data, fs, avg_hr=None):
     logging.debug(f"Found {len(valley_indices)} BP valleys in {len(bp_data)} samples ({len(bp_data)/fs:.1f}s), HR: {estimated_hr:.0f} bpm")
     return valley_indices
 
-def process_segment_data(subject_folder, segment):
+def process_segment_data(subject_folder, segment, moved_data_dir=None, shift_amount=None):
     bp_path = os.path.join(subject_folder, f'{segment}_bp.csv')
     if not os.path.exists(bp_path):
         return None
@@ -528,9 +579,21 @@ def process_segment_data(subject_folder, segment):
             
         df_bp = df_bp.sort_values(by='timestamp').reset_index(drop=True)
         
+        # Store original data for saving calibrated BP (before resampling)
+        original_timestamps = df_bp['timestamp'].values
+        original_bp = df_bp['bp'].values
+        
+        # Apply calibration to original data first (before resampling)
+        original_bp_calibrated, applied_shift = apply_bp_calibration(original_bp, subject_id, segment, shift_amount)
+        
+        # Save calibrated BP data with original timestamps if moved_data_dir is provided
+        if moved_data_dir is not None:
+            save_calibrated_bp(original_bp_calibrated, original_timestamps, subject_id, segment, moved_data_dir)
+        
+        # Now do resampling for processing pipeline
         bp_resampled, bp_timestamps = resample_data(
-            df_bp['bp'].values,
-            df_bp['timestamp'].values,
+            original_bp_calibrated,  # Use calibrated data for resampling
+            original_timestamps,
             config.BP_SAMPLING_RATE,
             config.TARGET_SAMPLING_RATE
         )
@@ -538,9 +601,7 @@ def process_segment_data(subject_folder, segment):
         if len(bp_resampled) == 0:
             return None
         
-        # Apply BP calibration - now passing subject_id
-        bp_calibrated, shift_amount = apply_bp_calibration(bp_resampled, subject_id, segment)
-        
+        # Continue with the rest of processing using resampled data
         ppg_data_dict = {}
         available_sensors = []
         
@@ -597,13 +658,13 @@ def process_segment_data(subject_folder, segment):
         
         logging.debug(f"Available sensors for {segment}: {available_sensors} ({len(available_sensors)}/{len(config.SENSORS_TO_USE)})")
         
-        min_length = min(len(bp_calibrated), min(len(data) for data in ppg_data_dict.values()))
+        min_length = min(len(bp_resampled), min(len(data) for data in ppg_data_dict.values()))
         
         if min_length < config.WINDOW_SIZE:
             logging.debug(f"Warning: Insufficient data length ({min_length}) for {segment}")
             return None
         
-        bp_aligned = bp_calibrated[:min_length]
+        bp_aligned = bp_resampled[:min_length]
         
         ppg_aligned = np.zeros((len(config.SENSORS_TO_USE), min_length))
         sensor_mask = np.zeros(len(config.SENSORS_TO_USE), dtype=bool)
@@ -692,6 +753,12 @@ def main():
     organize_raw_data(config.SHARED_DATA_DIR, config.RAW_DATA_DIR, all_subjects)
 
     os.makedirs(config.PROCESSED_DATA_DIR, exist_ok=True)
+    
+    # Create moved data directory for saving calibrated BP data
+    moved_data_dir = os.path.join(os.path.dirname(config.PROCESSED_DATA_DIR), 'moved')
+    os.makedirs(moved_data_dir, exist_ok=True)
+    logging.debug(f"Created moved data directory: {moved_data_dir}")
+    
     subject_splits = {"train": config.TRAIN_SUBJECTS, "validation": config.VALID_SUBJECTS, "test": config.TEST_SUBJECTS}
     
     for split_name, subjects in subject_splits.items():
@@ -699,6 +766,9 @@ def main():
             continue
             
         all_ppg_for_split, all_bp_for_split, all_masks_for_split = [], [], []
+        # Add separate collections for seg1 and seg7
+        seg1_ppg_for_split, seg1_bp_for_split, seg1_masks_for_split = [], [], []
+        seg7_ppg_for_split, seg7_bp_for_split, seg7_masks_for_split = [], [], []
         
         logging.debug(f"Generating {split_name.upper()} SET")
         for subject_id in tqdm(subjects, desc=f"Processing {split_name} subjects"):
@@ -707,9 +777,13 @@ def main():
                 logging.warning(f"Warning: Directory for subject {subject_id} not found.")
                 continue
 
+            # Calculate shift amount once per subject based on seg1
+            shift_amount = calculate_bp_shift_amount(subject_id)
+
             for segment in ['seg1', 'seg7']:
                 logging.debug(f"Processing {subject_id} - {segment}")
-                result = process_segment_data(subject_folder, segment)
+                # Pass both moved_data_dir and shift_amount to use consistent shift for both segments
+                result = process_segment_data(subject_folder, segment, moved_data_dir, shift_amount)
                 
                 if result is not None:
                     ppg_data, bp_data, sensor_mask = result
@@ -719,15 +793,28 @@ def main():
                     )
                     
                     if ppg_slices:
+                        # Add to combined dataset (existing logic)
                         all_ppg_for_split.extend(ppg_slices)
                         all_bp_for_split.extend(bp_slices)
                         all_masks_for_split.extend(mask_slices)
+                        
+                        # Add to segment-specific datasets
+                        if segment == 'seg1':
+                            seg1_ppg_for_split.extend(ppg_slices)
+                            seg1_bp_for_split.extend(bp_slices)
+                            seg1_masks_for_split.extend(mask_slices)
+                        elif segment == 'seg7':
+                            seg7_ppg_for_split.extend(ppg_slices)
+                            seg7_bp_for_split.extend(bp_slices)
+                            seg7_masks_for_split.extend(mask_slices)
+                        
                         logging.debug(f"Generated {len(ppg_slices)} valley-based slices from {segment}")
                     else:
                         logging.debug(f"No valid slices from {segment}")
                 else:
                     logging.debug(f"No data processed for {segment}")
 
+        # Save combined dataset (existing logic)
         if not all_ppg_for_split:
             logging.debug(f"No data generated for {split_name} set.")
             continue
@@ -736,7 +823,7 @@ def main():
         all_bp_np = np.array(all_bp_for_split, dtype=np.float32)
         all_masks_np = np.array(all_masks_for_split, dtype=bool)
         
-        logging.debug(f"Generated {len(all_ppg_np)} samples for {split_name} set")
+        logging.debug(f"Generated {len(all_ppg_np)} samples for {split_name} set (combined)")
         logging.debug(f"PPG shape: {all_ppg_np.shape}, BP shape: {all_bp_np.shape}, Mask shape: {all_masks_np.shape}")
         
         # 统计传感器可用率
@@ -746,7 +833,31 @@ def main():
         
         save_path_npz = os.path.join(config.PROCESSED_DATA_DIR, f"{split_name}_data.npz")
         np.savez(save_path_npz, ppg=all_ppg_np, bp=all_bp_np, sensor_mask=all_masks_np)
-        logging.debug(f"Saved to {save_path_npz}")
+        logging.debug(f"Saved combined dataset to {save_path_npz}")
+
+        # Save seg1-only dataset
+        if seg1_ppg_for_split:
+            seg1_ppg_np = np.array(seg1_ppg_for_split, dtype=np.float32)
+            seg1_bp_np = np.array(seg1_bp_for_split, dtype=np.float32)
+            seg1_masks_np = np.array(seg1_masks_for_split, dtype=bool)
+            
+            logging.debug(f"Generated {len(seg1_ppg_np)} samples for {split_name} set (seg1 only)")
+            
+            seg1_save_path = os.path.join(config.PROCESSED_DATA_DIR, f"{split_name}_seg1_data.npz")
+            np.savez(seg1_save_path, ppg=seg1_ppg_np, bp=seg1_bp_np, sensor_mask=seg1_masks_np)
+            logging.debug(f"Saved seg1 dataset to {seg1_save_path}")
+        
+        # Save seg7-only dataset
+        if seg7_ppg_for_split:
+            seg7_ppg_np = np.array(seg7_ppg_for_split, dtype=np.float32)
+            seg7_bp_np = np.array(seg7_bp_for_split, dtype=np.float32)
+            seg7_masks_np = np.array(seg7_masks_for_split, dtype=bool)
+            
+            logging.debug(f"Generated {len(seg7_ppg_np)} samples for {split_name} set (seg7 only)")
+            
+            seg7_save_path = os.path.join(config.PROCESSED_DATA_DIR, f"{split_name}_seg7_data.npz")
+            np.savez(seg7_save_path, ppg=seg7_ppg_np, bp=seg7_bp_np, sensor_mask=seg7_masks_np)
+            logging.debug(f"Saved seg7 dataset to {seg7_save_path}")
 
         NUM_SAMPLES_TO_SAVE = 5
         csv_sample_dir = os.path.join(config.PROCESSED_DATA_DIR, f"{split_name}_csv_samples")
@@ -775,6 +886,39 @@ def main():
             bp_sample = all_bp_np[idx]
             bp_df = pd.DataFrame(bp_sample, columns=['bp'])
             bp_df.to_csv(os.path.join(csv_sample_dir, f"sample_{i}_bp.csv"), index=False)
+    
+    logging.debug(f"All calibrated BP data saved to: {moved_data_dir}")
+    print(f"\nCalibrated BP data saved to: {moved_data_dir}")
+    print("Directory structure:")
+    print("moved/")
+    for subject_id in all_subjects:
+        moved_subject_dir = os.path.join(moved_data_dir, subject_id)
+        if os.path.exists(moved_subject_dir):
+            files = os.listdir(moved_subject_dir)
+            bp_files = [f for f in files if f.endswith('_bp.csv')]
+            if bp_files:
+                print(f"  {subject_id}/")
+                for bp_file in sorted(bp_files):
+                    print(f"    {bp_file}")
+    
+    # Print summary of generated datasets
+    print(f"\nGenerated datasets in: {config.PROCESSED_DATA_DIR}")
+    print("Dataset files:")
+    for split_name in ["train", "validation", "test"]:
+        # Combined dataset
+        combined_path = os.path.join(config.PROCESSED_DATA_DIR, f"{split_name}_data.npz")
+        if os.path.exists(combined_path):
+            print(f"  {split_name}_data.npz (seg1 + seg7 combined)")
+        
+        # Seg1 only dataset
+        seg1_path = os.path.join(config.PROCESSED_DATA_DIR, f"{split_name}_seg1_data.npz")
+        if os.path.exists(seg1_path):
+            print(f"  {split_name}_seg1_data.npz (seg1 only)")
+        
+        # Seg7 only dataset
+        seg7_path = os.path.join(config.PROCESSED_DATA_DIR, f"{split_name}_seg7_data.npz")
+        if os.path.exists(seg7_path):
+            print(f"  {split_name}_seg7_data.npz (seg7 only)")
 
 if __name__ == "__main__":
     main()
