@@ -35,6 +35,55 @@ warnings.filterwarnings('ignore', category=RuntimeWarning)
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
+def create_windowed_visualizations(subject_id, split_name, window_hr_valid, window_all_valid, sensor_signals, window_peaks, fs, window_size, stride):
+    """每人窗口级可视化，展示每个窗口每个 sensor 的 hr_valid 状态（绿色/红色），叠加信号和峰值"""
+    import matplotlib.pyplot as plt
+    n_sensors = window_hr_valid.shape[1]
+    n_windows = window_hr_valid.shape[0]
+    fig, axes = plt.subplots(n_sensors, 1, figsize=(20, 4*n_sensors), sharex=True)
+    if n_sensors == 1:
+        axes = [axes]
+    colors = ['red', 'blue', 'green', 'orange']
+    time = np.arange(window_size) / fs
+    for idx in range(n_sensors):
+        ax = axes[idx]
+        sensor = config.SENSORS_TO_USE[idx]
+        signal_data = sensor_signals.get(sensor, None)
+        if signal_data is not None:
+            sig = signal_data['signal']
+            sig_fs = signal_data['fs']
+            sig_time = np.arange(len(sig)) / sig_fs
+            ax.plot(sig_time, sig, color=colors[idx % len(colors)], linewidth=0.8, alpha=0.6, label=f'{sensor} IR')
+        # 绘制窗口状态
+        for w in range(n_windows):
+            start_idx = w * stride
+            end_idx = start_idx + window_size
+            start_time = start_idx / fs
+            end_time = end_idx / fs
+            if window_hr_valid[w, idx]:
+                ax.axvspan(start_time, end_time, alpha=0.18, color='green')
+            else:
+                ax.axvspan(start_time, end_time, alpha=0.10, color='red')
+            # 标记峰值
+            peaks = window_peaks.get(sensor, {}).get(w, [])
+            if signal_data is not None and peaks:
+                peak_times = np.array(peaks) / fs + start_time
+                peak_vals = [sig[p] if p < len(sig) else np.nan for p in peaks]
+                ax.scatter(peak_times, peak_vals, color='black', s=20, zorder=5)
+        ax.set_title(f'{sensor} IR - windowed_validation (green=valid, red=invalid)', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Signal', fontsize=10)
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+    axes[-1].set_xlabel('Time (seconds)', fontsize=12)
+    plt.suptitle(f'Subject {subject_id} - {split_name} windowed_validation_result', fontsize=16, fontweight='bold')
+    plt.tight_layout()
+    out_dir = getattr(config, 'SUBJECT_OVERVIEW_DIR', './')
+    os.makedirs(out_dir, exist_ok=True)
+    plot_file = os.path.join(out_dir, f"windowed_validation_{subject_id}_{split_name}.png")
+    plt.savefig(plot_file, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"📊 保存窗口验证图: {plot_file}")
+
 def decompress_archives(source_dir):
     logging.debug(f"Scanning for archives in: {source_dir}")
     archives = glob.glob(os.path.join(source_dir, "*.tar")) + glob.glob(os.path.join(source_dir, "*.tar.gz"))
@@ -245,6 +294,35 @@ def load_heart_rate(subject_folder, segment):
         
     except Exception as e:
         logging.debug(f"Error loading HR data: {e}")
+        return None
+
+def load_hr_series(subject_folder, segment):
+    """
+    加载每个分段的 HR 时间序列，返回 DataFrame(columns=[timestamp, hr, rel_time_s])。
+    rel_time_s = timestamp - timestamp.iloc[0]
+    如果文件缺失或无效，返回 None。
+    """
+    hr_path = os.path.join(subject_folder, f'{segment}_hr.csv')
+    if not os.path.exists(hr_path):
+        logging.debug(f"HR series file not found: {hr_path}")
+        return None
+    try:
+        df_hr = pd.read_csv(hr_path, header=None, dtype=str)
+        if df_hr.shape[1] < 2:
+            logging.debug(f"Invalid HR file format: {hr_path}")
+            return None
+        df_hr.columns = ['timestamp', 'hr']
+        df_hr['timestamp'] = pd.to_numeric(df_hr['timestamp'], errors='coerce')
+        df_hr['hr'] = pd.to_numeric(df_hr['hr'], errors='coerce')
+        df_hr.dropna(inplace=True)
+        if df_hr.empty:
+            return None
+        df_hr = df_hr.sort_values('timestamp').reset_index(drop=True)
+        t0 = df_hr['timestamp'].iloc[0]
+        df_hr['rel_time_s'] = df_hr['timestamp'] - t0
+        return df_hr
+    except Exception as e:
+        logging.debug(f"Error loading HR series: {e}")
         return None
 
 def load_omron_data():
@@ -703,10 +781,10 @@ def create_slices_from_valleys(ppg_data, bp_data, sensor_mask, subject_folder, s
         segment: Segment name (for loading HR)
     
     Returns:
-        ppg_slices, bp_slices, mask_slices: 切片列表
+        ppg_slices, bp_slices, mask_slices, window_start_indices: 列表，window_start_indices 为每个窗口在重采样轨上的起始样本索引
     """
     if ppg_data.shape[1] < config.WINDOW_SIZE:
-        return [], [], []
+        return [], [], [], []
     
     # Load heart rate if available
     avg_hr = load_heart_rate(subject_folder, segment)
@@ -716,9 +794,13 @@ def create_slices_from_valleys(ppg_data, bp_data, sensor_mask, subject_folder, s
     
     if len(valley_indices) < 2:
         logging.debug("Warning: Insufficient BP valleys found, using original slicing method")
-        return create_slices(ppg_data, bp_data, sensor_mask)
+        ppg_slices, bp_slices, mask_slices = create_slices(ppg_data, bp_data, sensor_mask)
+        # 退化路径没有精确的起始索引，这里使用等间隔步长近似（以 STRIDE_SIZE 为步长）
+        window_start_indices = [i for i in range(0, bp_data.shape[0] - config.WINDOW_SIZE + 1, config.STRIDE_SIZE)] if ppg_slices else []
+        return ppg_slices, bp_slices, mask_slices, window_start_indices
     
     ppg_slices, bp_slices, mask_slices = [], [], []
+    window_start_indices = []
     
     # 从每个波谷开始创建10秒窗口
     for valley_idx in valley_indices:
@@ -735,9 +817,10 @@ def create_slices_from_valleys(ppg_data, bp_data, sensor_mask, subject_folder, s
             ppg_slices.append(ppg_slice)
             bp_slices.append(bp_slice)
             mask_slices.append(sensor_mask)
+            window_start_indices.append(valley_idx)
     
     logging.debug(f"Created {len(ppg_slices)} valley-based slices from {len(valley_indices)} valleys")
-    return ppg_slices, bp_slices, mask_slices
+    return ppg_slices, bp_slices, mask_slices, window_start_indices
 
 def _compute_snr_per_channel(ppg_slice: np.ndarray, fs: int):
     """Compute per-channel SNR within [SNR_BAND_LOW, SNR_BAND_HIGH] using a simple spectral method.
@@ -946,6 +1029,9 @@ def main():
         export_rows_all = []
         export_rows_seg1 = []
         export_rows_seg7 = []
+        # 汇总每人的通过统计
+        split_subject_pass_rows = []
+
         for subject_id in tqdm(subjects, desc=f"Processing {split_name} subjects"):
             # prepare per-subject best/worst window candidates per sensor
             best_worst = {i: {'best': None, 'worst': None} for i in range(len(config.SENSORS_TO_USE))}
@@ -966,15 +1052,315 @@ def main():
                 if result is not None:
                     ppg_data, bp_data, sensor_mask = result
                     # 使用新的从波谷开始的切片方法，传入subject_folder和segment用于加载HR
-                    ppg_slices, bp_slices, mask_slices = create_slices_from_valleys(
+                    ppg_slices, bp_slices, mask_slices, window_start_indices = create_slices_from_valleys(
                         ppg_data, bp_data, sensor_mask, subject_folder, segment
                     )
+                    # 加载 HR 时间序列用于真实 HR 统计
+                    df_hr_series = load_hr_series(subject_folder, segment)
                     
                     if ppg_slices:
                         # Add to combined dataset (existing logic)
                         all_ppg_for_split.extend(ppg_slices)
                         all_bp_for_split.extend(bp_slices)
                         all_masks_for_split.extend(mask_slices)
+
+                        # 统计窗口级 hr_valid
+                        window_hr_valid = []  # shape (n_windows, n_sensors)
+                        window_all_valid = [] # shape (n_windows,)
+                        sensor_signals = {}
+                        window_peaks = {s: {} for s in config.SENSORS_TO_USE}
+                        # 收集每个传感器的 HR 统计
+                        per_sensor_stats = {s: {'peak': [], 'fft': [], 'diff': []} for s in config.SENSORS_TO_USE}
+                        # 收集每个传感器在每窗口的多种一致性标记（pf/pt/ft/triple）
+                        per_sensor_flags = {s: {
+                            'pf_valid_vec': [],
+                            'pt_valid_vec': [], 'pt_avail_vec': [],
+                            'ft_valid_vec': [], 'ft_avail_vec': [],
+                            'triple_valid_vec': [], 'triple_avail_vec': []
+                        } for s in config.SENSORS_TO_USE}
+                        fs = config.TARGET_SAMPLING_RATE
+                        window_size = config.WINDOW_SIZE
+                        stride = config.STRIDE_SIZE
+                        tol_bpm = getattr(config, 'HR_TOLERANCE_BPM', 5)
+                        # 初始化本段 per-window 物理特征收集器
+                        per_window_rows = []
+                        for w, ppg_slice in enumerate(ppg_slices):
+                            C, L = ppg_slice.shape
+                            valid_flags = []
+                            # 真实 HR：窗口内均值（若 HR 序列存在）
+                            true_hr_window = np.nan
+                            if df_hr_series is not None:
+                                start_idx = window_start_indices[w]
+                                end_idx = start_idx + window_size
+                                start_time = start_idx / fs
+                                end_time = end_idx / fs
+                                hr_in_win = df_hr_series[(df_hr_series['rel_time_s'] >= start_time) & (df_hr_series['rel_time_s'] < end_time)]['hr']
+                                if not hr_in_win.empty:
+                                    true_hr_window = float(hr_in_win.mean())
+                            # 预先计算本窗口的每通道 SNR
+                            try:
+                                snr_vals = _compute_snr_per_channel(ppg_slice, fs=config.TARGET_SAMPLING_RATE)
+                            except Exception:
+                                snr_vals = None
+                            for c in range(C):
+                                x = ppg_slice[c]
+                                hr_peak_bpm, peak_idx_list, peak_count = _estimate_hr_peak_and_peaks(x, fs)
+                                hr_fft_bpm = _estimate_hr_fft(x, fs, getattr(config, 'HR_MIN_BPM', 50), getattr(config, 'HR_MAX_BPM', 200))
+                                hr_diff = float(abs(hr_peak_bpm - hr_fft_bpm)) if (hr_peak_bpm > 0 and hr_fft_bpm > 0) else float('inf')
+                                hr_valid = (hr_peak_bpm > 0 and hr_fft_bpm > 0 and hr_diff <= tol_bpm and peak_count >= getattr(config, 'PEAK_MIN_COUNT', 3))
+                                valid_flags.append(hr_valid)
+                                # 收集峰值
+                                sensor = config.SENSORS_TO_USE[c]
+                                window_peaks[sensor][w] = list(peak_idx_list)
+                                # 收集 HR 统计（仅当两者都有值）
+                                if hr_peak_bpm > 0 and hr_fft_bpm > 0 and np.isfinite(hr_diff):
+                                    per_sensor_stats[sensor]['peak'].append(float(hr_peak_bpm))
+                                    per_sensor_stats[sensor]['fft'].append(float(hr_fft_bpm))
+                                    per_sensor_stats[sensor]['diff'].append(float(hr_diff))
+                                # 每窗口物理特征导出（含 SNR、频谱能量比、真实HR等）——始终导出
+                                snr_c = float(snr_vals[c]) if (snr_vals is not None and np.isfinite(snr_vals[c])) else np.nan
+                                freqs = np.fft.rfftfreq(L, d=1.0/fs)
+                                X = np.fft.rfft(x - np.mean(x))
+                                P = np.abs(X) ** 2
+                                band_mask = (freqs >= config.PPG_FILTER_LOW) & (freqs <= config.PPG_FILTER_HIGH)
+                                band_power = float(P[band_mask].sum()) if np.any(band_mask) else np.nan
+                                total_power = float(P.sum())
+                                spr = float(np.clip(band_power / (total_power + 1e-8), 0, 1)) if np.isfinite(band_power) else np.nan
+                                # 写一行
+                                start_idx = window_start_indices[w]
+                                end_idx = start_idx + window_size
+                                per_window_rows.append({
+                                    'split': split_name,
+                                    'subject_id': subject_id,
+                                    'segment': segment,
+                                    'window_idx': w,
+                                    'window_start_idx': int(start_idx),
+                                    'window_end_idx': int(end_idx),
+                                    'window_start_time_s': round(start_idx / fs, 6),
+                                    'window_end_time_s': round(end_idx / fs, 6),
+                                    'sensor_idx': int(c),
+                                    'sensor_name': sensor,
+                                    'peak_hr_bpm': float(hr_peak_bpm),
+                                    'fft_hr_bpm': float(hr_fft_bpm),
+                                    'hr_diff_bpm': float(hr_diff) if np.isfinite(hr_diff) else np.nan,
+                                    'peak_count': int(peak_count),
+                                    'snr_db': snr_c,
+                                    'spr': spr,
+                                    'band_power': band_power,
+                                    'total_power': total_power,
+                                    'hr_valid': bool(hr_valid),
+                                    'all_channels_valid': None,
+                                    'true_hr_bpm': float(true_hr_window) if np.isfinite(true_hr_window) else np.nan,
+                                })
+                                # 收集一致性标记
+                                pf_valid = bool(hr_valid)
+                                pt_avail = (np.isfinite(true_hr_window) and hr_peak_bpm > 0)
+                                ft_avail = (np.isfinite(true_hr_window) and hr_fft_bpm > 0)
+                                pt_valid = (pt_avail and abs(hr_peak_bpm - true_hr_window) <= tol_bpm)
+                                ft_valid = (ft_avail and abs(hr_fft_bpm - true_hr_window) <= tol_bpm)
+                                triple_avail = (pt_avail and ft_avail and hr_peak_bpm > 0 and hr_fft_bpm > 0)
+                                triple_valid = (triple_avail and pf_valid and pt_valid and ft_valid)
+                                per_sensor_flags[sensor]['pf_valid_vec'].append(pf_valid)
+                                per_sensor_flags[sensor]['pt_avail_vec'].append(bool(pt_avail))
+                                per_sensor_flags[sensor]['pt_valid_vec'].append(bool(pt_valid))
+                                per_sensor_flags[sensor]['ft_avail_vec'].append(bool(ft_avail))
+                                per_sensor_flags[sensor]['ft_valid_vec'].append(bool(ft_valid))
+                                per_sensor_flags[sensor]['triple_avail_vec'].append(bool(triple_avail))
+                                per_sensor_flags[sensor]['triple_valid_vec'].append(bool(triple_valid))
+                                # 收集信号（只存一次）
+                                if w == 0:
+                                    sensor_signals[sensor] = {'signal': ppg_data[c], 'fs': fs}
+                            # 本窗口全部通道处理完毕后，计算 all_channels_valid 并回填到本窗口的所有行
+                            all_flag = bool(all(valid_flags))
+                            start_row = len(per_window_rows) - C
+                            if start_row >= 0:
+                                for i in range(C):
+                                    per_window_rows[start_row + i]['all_channels_valid'] = all_flag
+                            window_hr_valid.append(valid_flags)
+                            window_all_valid.append(all_flag)
+                        window_hr_valid = np.array(window_hr_valid)
+                        window_all_valid = np.array(window_all_valid)
+                        # 输出统计
+                        hr_valid_ratio = np.mean(window_hr_valid)
+                        all_valid_ratio = np.mean(window_all_valid)
+                        print(f"Subject {subject_id} {split_name} segment {segment}: hr_valid通过率={hr_valid_ratio:.3f}, 四通道全通过比例={all_valid_ratio:.3f}")
+                        # 可视化
+                        create_windowed_visualizations(subject_id, f"{split_name}_{segment}", window_hr_valid, window_all_valid, sensor_signals, window_peaks, fs, window_size, stride)
+                        # 记录本受试者在本段的通过情况（总体 & 分通道）
+                        row = {
+                            'split': split_name,
+                            'subject_id': subject_id,
+                            'segment': segment,
+                            'total_windows': int(window_hr_valid.shape[0]),
+                            'all_channels_pass_windows': int(np.sum(window_all_valid)),
+                            'all_channels_pass_ratio': float(all_valid_ratio),
+                        }
+                        for s_idx, sensor in enumerate(config.SENSORS_TO_USE):
+                            row[f'{sensor}_pass_windows'] = int(np.sum(window_hr_valid[:, s_idx]))
+                            row[f'{sensor}_pass_ratio'] = float(np.mean(window_hr_valid[:, s_idx]))
+                        split_subject_pass_rows.append(row)
+
+                        # 保存每人每段的物理特征 CSV
+                        try:
+                            if 'per_window_rows' in locals() and per_window_rows:
+                                out_dir = getattr(config, 'SUBJECT_OVERVIEW_DIR', './')
+                                os.makedirs(out_dir, exist_ok=True)
+                                cols = ['split','subject_id','segment','window_idx','window_start_idx','window_end_idx','window_start_time_s','window_end_time_s','sensor_idx','sensor_name','peak_hr_bpm','fft_hr_bpm','hr_diff_bpm','peak_count','snr_db','spr','band_power','total_power','hr_valid','all_channels_valid','true_hr_bpm']
+                                per_window_df = pd.DataFrame(per_window_rows, columns=cols)
+                                per_file = os.path.join(out_dir, f"physics_features_{subject_id}_{split_name}_{segment}.csv")
+                                per_window_df.to_csv(per_file, index=False)
+                                print(f"💾 保存物理特征CSV: {per_file}")
+                        except Exception as e:
+                            logging.debug(f"保存 per-window 物理特征失败: {e}")
+
+                        # 保存统计结果（每个传感器与所有传感器同时有效）
+                        try:
+                            out_dir = getattr(config, 'SUBJECT_OVERVIEW_DIR', './')
+                            os.makedirs(out_dir, exist_ok=True)
+
+                            # 1) 每传感器统计汇总
+                            per_sensor_rows = []
+                            total_windows = int(window_hr_valid.shape[0])
+                            for s_idx, sensor in enumerate(config.SENSORS_TO_USE):
+                                valid_windows = int(np.sum(window_hr_valid[:, s_idx]))
+                                ratio = float(valid_windows / total_windows) if total_windows > 0 else 0.0
+                                # 计算 HR 指标均值
+                                def _mean_safe(arr):
+                                    return float(np.mean(arr)) if (arr is not None and len(arr) > 0) else np.nan
+                                avg_peak = _mean_safe(per_sensor_stats[sensor]['peak'])
+                                avg_fft = _mean_safe(per_sensor_stats[sensor]['fft'])
+                                avg_diff = _mean_safe(per_sensor_stats[sensor]['diff'])
+                                # 计算 pf/pt/ft/triple 统计
+                                pf_valid_windows = int(np.sum(per_sensor_flags[sensor]['pf_valid_vec']))
+                                pf_valid_ratio = float(pf_valid_windows / total_windows) if total_windows > 0 else 0.0
+                                pt_total = int(np.sum(per_sensor_flags[sensor]['pt_avail_vec']))
+                                pt_valid_windows = int(np.sum(per_sensor_flags[sensor]['pt_valid_vec']))
+                                pt_valid_ratio = float(pt_valid_windows / pt_total) if pt_total > 0 else np.nan
+                                ft_total = int(np.sum(per_sensor_flags[sensor]['ft_avail_vec']))
+                                ft_valid_windows = int(np.sum(per_sensor_flags[sensor]['ft_valid_vec']))
+                                ft_valid_ratio = float(ft_valid_windows / ft_total) if ft_total > 0 else np.nan
+                                triple_total = int(np.sum(per_sensor_flags[sensor]['triple_avail_vec']))
+                                triple_valid_windows = int(np.sum(per_sensor_flags[sensor]['triple_valid_vec']))
+                                triple_valid_ratio = float(triple_valid_windows / triple_total) if triple_total > 0 else np.nan
+                                per_sensor_rows.append({
+                                    'split': split_name,
+                                    'subject_id': subject_id,
+                                    'segment': segment,
+                                    'sensor': sensor,
+                                    'total_windows': total_windows,
+                                    'valid_windows': valid_windows,
+                                    'valid_ratio': round(ratio, 6),
+                                    'avg_peak_hr_bpm': round(avg_peak, 3) if np.isfinite(avg_peak) else np.nan,
+                                    'avg_fft_hr_bpm': round(avg_fft, 3) if np.isfinite(avg_fft) else np.nan,
+                                    'avg_hr_diff_bpm': round(avg_diff, 3) if np.isfinite(avg_diff) else np.nan,
+                                    # pf（时域-频域）
+                                    'pf_valid_windows': pf_valid_windows,
+                                    'pf_valid_ratio': round(pf_valid_ratio, 6),
+                                    # pt（时域-真实）
+                                    'pt_total_truehr_windows': pt_total,
+                                    'pt_valid_windows': pt_valid_windows,
+                                    'pt_valid_ratio': round(pt_valid_ratio, 6) if np.isfinite(pt_valid_ratio) else np.nan,
+                                    # ft（频域-真实）
+                                    'ft_total_truehr_windows': ft_total,
+                                    'ft_valid_windows': ft_valid_windows,
+                                    'ft_valid_ratio': round(ft_valid_ratio, 6) if np.isfinite(ft_valid_ratio) else np.nan,
+                                    # triple（三者都<=阈值）
+                                    'triple_total_truehr_windows': triple_total,
+                                    'triple_valid_windows': triple_valid_windows,
+                                    'triple_valid_ratio': round(triple_valid_ratio, 6) if np.isfinite(triple_valid_ratio) else np.nan,
+                                })
+
+                            # 2) 所有传感器同时有效统计
+                            all_valid_count = int(np.sum(window_all_valid))
+                            all_valid_ratio = float(all_valid_count / total_windows) if total_windows > 0 else 0.0
+                            # 计算 pt/ft/triple 的“所有传感器同时满足”的窗口数
+                            def _all_sensors_count(flag_key, avail_key=None):
+                                count = 0
+                                for w_idx in range(total_windows):
+                                    ok = True
+                                    for s in config.SENSORS_TO_USE:
+                                        if avail_key is not None:
+                                            if not per_sensor_flags[s][avail_key][w_idx]:
+                                                ok = False
+                                                break
+                                        if not per_sensor_flags[s][flag_key][w_idx]:
+                                            ok = False
+                                            break
+                                    if ok:
+                                        count += 1
+                                return count
+                            pt_all_count = _all_sensors_count('pt_valid_vec', 'pt_avail_vec')
+                            ft_all_count = _all_sensors_count('ft_valid_vec', 'ft_avail_vec')
+                            triple_all_count = _all_sensors_count('triple_valid_vec', 'triple_avail_vec')
+                            pt_all_ratio = float(pt_all_count / total_windows) if total_windows > 0 else 0.0
+                            ft_all_ratio = float(ft_all_count / total_windows) if total_windows > 0 else 0.0
+                            triple_all_ratio = float(triple_all_count / total_windows) if total_windows > 0 else 0.0
+
+                            # 在每传感器表尾部附加总览行
+                            per_sensor_rows.append({
+                                'split': split_name,
+                                'subject_id': subject_id,
+                                'segment': segment,
+                                'sensor': 'ALL_SENSORS',
+                                'total_windows': total_windows,
+                                'valid_windows': all_valid_count,
+                                'valid_ratio': round(all_valid_ratio, 6),
+                                'pf_valid_windows': all_valid_count,
+                                'pf_valid_ratio': round(all_valid_ratio, 6),
+                                'pt_all_sensors_windows': pt_all_count,
+                                'pt_all_sensors_ratio': round(pt_all_ratio, 6),
+                                'ft_all_sensors_windows': ft_all_count,
+                                'ft_all_sensors_ratio': round(ft_all_ratio, 6),
+                                'triple_all_sensors_windows': triple_all_count,
+                                'triple_all_sensors_ratio': round(triple_all_ratio, 6),
+                            })
+
+                            per_sensor_df = pd.DataFrame(per_sensor_rows)
+                            stats_file = os.path.join(out_dir, f"window_stats_{subject_id}_{split_name}_{segment}.csv")
+                            per_sensor_df.to_csv(stats_file, index=False)
+                            print(f"💾 保存每传感器统计: {stats_file}")
+
+                            # 3) 所有传感器同时有效的窗口详情（window_idx 与时间）
+                            all_valid_detail_rows = []
+                            for w_idx, is_all_ok in enumerate(window_all_valid.tolist()):
+                                start_idx = w_idx * stride
+                                end_idx = start_idx + window_size
+                                start_time = start_idx / fs
+                                end_time = end_idx / fs
+                                all_valid_detail_rows.append({
+                                    'split': split_name,
+                                    'subject_id': subject_id,
+                                    'segment': segment,
+                                    'window_idx': w_idx,
+                                    'start_time_s': round(float(start_time), 6),
+                                    'end_time_s': round(float(end_time), 6),
+                                    'all_sensors_valid': bool(is_all_ok),
+                                })
+                            all_valid_df = pd.DataFrame(all_valid_detail_rows)
+                            all_valid_file = os.path.join(out_dir, f"all_sensors_valid_windows_{subject_id}_{split_name}_{segment}.csv")
+                            all_valid_df.to_csv(all_valid_file, index=False)
+                            print(f"💾 保存全传感器窗口详情: {all_valid_file}")
+
+                            # 4) 窗口-传感器有效矩阵（便于后续分析）
+                            matrix_rows = []
+                            sensor_cols = [f"valid_{s}" for s in config.SENSORS_TO_USE]
+                            for w_idx in range(total_windows):
+                                row = {
+                                    'split': split_name,
+                                    'subject_id': subject_id,
+                                    'segment': segment,
+                                    'window_idx': w_idx,
+                                    'all_sensors_valid': bool(window_all_valid[w_idx]),
+                                }
+                                for s_idx, sensor in enumerate(config.SENSORS_TO_USE):
+                                    row[f"valid_{sensor}"] = bool(window_hr_valid[w_idx, s_idx])
+                                matrix_rows.append(row)
+                            matrix_df = pd.DataFrame(matrix_rows)
+                            matrix_file = os.path.join(out_dir, f"window_hr_valid_matrix_{subject_id}_{split_name}_{segment}.csv")
+                            matrix_df.to_csv(matrix_file, index=False)
+                            print(f"💾 保存有效矩阵: {matrix_file}")
+                        except Exception as e:
+                            logging.debug(f"保存窗口统计失败: {e}")
 
                         # Phase 2 (record-only): compute SQI per slice if enabled
                         if getattr(config, 'SQI_REPORT_ONLY', False):
@@ -1194,6 +1580,18 @@ def main():
             # After both segments processed for this subject, render overview if enabled
             if getattr(config, 'SQI_SUBJECT_OVERVIEW', False):
                 _render_subject_overview(best_worst, subject_id=subject_id, split_name=split_name)
+
+        # 在当前 split 结束后，保存“所有人的通过统计”
+        try:
+            if split_subject_pass_rows:
+                out_dir = getattr(config, 'SQI_REPORT_DIR', './')
+                os.makedirs(out_dir, exist_ok=True)
+                pass_df = pd.DataFrame(split_subject_pass_rows)
+                pass_file = os.path.join(out_dir, f'subject_pass_summary_{split_name}.csv')
+                pass_df.to_csv(pass_file, index=False)
+                print(f"💾 保存所有人的通过统计: {pass_file}")
+        except Exception as e:
+            logging.debug(f"保存所有人通过统计失败: {e}")
 
         # Save combined dataset (existing logic)
         if not all_ppg_for_split:
