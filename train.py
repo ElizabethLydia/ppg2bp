@@ -12,6 +12,18 @@ from model.model import UNet1D
 # --- MODIFICATION: Import the new attention-based loss function ---
 from loss.trend_loss import CombinedBPAttentionLoss
 
+# Reproducibility utilities
+import random
+
+def set_seed(seed: int):
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 def train_one_epoch(model, dataloader, criterion, optimizer, device):
     model.train()
     
@@ -105,6 +117,8 @@ def validate_one_epoch(model, dataloader, criterion, device):
     }
 
 def main():
+    # Phase 0: enforce reproducibility
+    set_seed(getattr(config, "SEED", 42))
     swanlab.init(
     project="ppg2bp-train",
     name="unet1d-bp-loss-seg1*",
@@ -128,10 +142,15 @@ def main():
         print("Error: Train or validation dataset is empty.")
         return
 
+    def _worker_init_fn(worker_id):
+        seed = (getattr(config, "SEED", 42) + worker_id) % (2**32 - 1)
+        np.random.seed(seed)
+        random.seed(seed)
+
     train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, 
-                             num_workers=4, pin_memory=True, drop_last=True)
+                             num_workers=4, pin_memory=True, drop_last=True, worker_init_fn=_worker_init_fn)
     val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, 
-                           num_workers=4, pin_memory=True, drop_last=False)
+                           num_workers=4, pin_memory=True, drop_last=False, worker_init_fn=_worker_init_fn)
     print(f"Train samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
 
     print(f"Initializing model on device: {config.DEVICE}")
@@ -141,7 +160,10 @@ def main():
     criterion = CombinedBPAttentionLoss(
         sbp_dbp_weight=0.4, 
         trend_weight=0.4, 
-        notch_weight=0.2
+        notch_weight=0.2,
+        sbp_dbp_mode=getattr(config, 'SBP_DBP_MODE', 'mse'),
+        huber_delta=getattr(config, 'HUBER_DELTA', 1.0),
+        mix_alpha=getattr(config, 'MIX_ALPHA', 0.5)
     )
     print("Using CombinedBPAttentionLoss with weights - SBP/DBP: 40%, Trend: 40%, Notch: 20%")
     
@@ -187,8 +209,8 @@ def main():
         val_loss = val_metrics['total_loss']
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            os.makedirs("saved_models", exist_ok=True)
-            model_path = os.path.join("saved_models", "best_model.pth")
+            os.makedirs(config.SAVED_MODELS_DIR, exist_ok=True)
+            model_path = os.path.join(config.SAVED_MODELS_DIR, "best_model.pth")
             torch.save({'epoch': epoch, 'model_state_dict': model.state_dict(), 'best_val_loss': best_val_loss}, model_path)
             print(f"  Validation loss improved. Saved new best model to {model_path}")
             epochs_no_improve = 0
@@ -198,8 +220,8 @@ def main():
 
         # NEW: Save model at every 5th epoch (5, 10, 15, 20, etc.)
         if (epoch + 1) % 5 == 0:
-            os.makedirs("saved_models", exist_ok=True)
-            epoch_model_path = os.path.join("saved_models", f"model_epoch_{epoch+1}.pth")
+            os.makedirs(config.SAVED_MODELS_DIR, exist_ok=True)
+            epoch_model_path = os.path.join(config.SAVED_MODELS_DIR, f"model_epoch_{epoch+1}.pth")
             torch.save({
                 'epoch': epoch, 
                 'model_state_dict': model.state_dict(), 
@@ -232,8 +254,8 @@ def main():
             best_epoch = np.argmin([m['total_loss'] for m in val_metrics_history]) + 1
             plt.axvline(best_epoch, color='r', linestyle='--', alpha=0.7, label=f'Best Val Loss (Epoch {best_epoch})')
         plt.legend(); plt.grid(True, alpha=0.3)
-        os.makedirs("results", exist_ok=True)
-        plt.savefig(os.path.join("results", "loss_curve.png"), dpi=300)
+        os.makedirs(config.RESULTS_DIR, exist_ok=True)
+        plt.savefig(os.path.join(config.RESULTS_DIR, "loss_curve.png"), dpi=300)
         plt.close()
         print("Total loss curve saved.")
 
@@ -258,7 +280,7 @@ def main():
         plt.yscale('log')
         plt.suptitle('Note: Y-axis is in log scale to show all components clearly', fontsize=10, y=0.92)
 
-        plt.savefig(os.path.join("results", "loss_components_curve.png"), dpi=300)
+        plt.savefig(os.path.join(config.RESULTS_DIR, "loss_components_curve.png"), dpi=300)
         plt.close()
         print("Loss components curve saved.")
 

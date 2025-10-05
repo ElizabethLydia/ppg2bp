@@ -13,9 +13,20 @@ import logging
 import warnings
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG, 
+from datetime import datetime
+import matplotlib.pyplot as plt
+import csv
+
+# Centralized logging under config.LOG_DIR
+try:
+    os.makedirs(getattr(__import__('config'), 'LOG_DIR', './'), exist_ok=True)
+    log_path = os.path.join(getattr(__import__('config'), 'LOG_DIR', './'), f'processing_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+except Exception:
+    log_path = 'processing.log'
+
+logging.basicConfig(level=logging.DEBUG,
                    format='%(asctime)s - %(levelname)s - %(message)s',
-                   filename='processing.log',
+                   filename=log_path,
                    filemode='w')
 
 # Suppress pandas warnings
@@ -728,6 +739,42 @@ def create_slices_from_valleys(ppg_data, bp_data, sensor_mask, subject_folder, s
     logging.debug(f"Created {len(ppg_slices)} valley-based slices from {len(valley_indices)} valleys")
     return ppg_slices, bp_slices, mask_slices
 
+def _compute_snr_per_channel(ppg_slice: np.ndarray, fs: int):
+    """Compute per-channel SNR within [SNR_BAND_LOW, SNR_BAND_HIGH] using a simple spectral method.
+    Steps: Welch/rFFT power; find f0 in HR range; signal band = [f0-δ, f0+δ]; noise band = band - signal; SNR = 10*log10(Psig / Pnoise_mean).
+    Returns: np.ndarray shape (C,) with SNR in dB (float), NaN if cannot compute.
+    """
+    try:
+        C, L = ppg_slice.shape
+    except Exception:
+        return None
+    snrs = np.full((C,), np.nan, dtype=np.float32)
+    # frequency grid
+    freqs = np.fft.rfftfreq(L, d=1.0/fs)
+    band_mask = (freqs >= getattr(config, 'SNR_BAND_LOW', 0.5)) & (freqs <= getattr(config, 'SNR_BAND_HIGH', 3.0))
+    hr_low, hr_high = getattr(config, 'SNR_HR_RANGE', (0.7, 2.5))
+    peak_nb = getattr(config, 'SNR_PEAK_NEIGHBOR', 0.12)
+    eps = 1e-12
+    for c in range(C):
+        x = ppg_slice[c] - np.mean(ppg_slice[c])
+        X = np.fft.rfft(x)
+        P = (np.abs(X) ** 2)
+        if not np.any(band_mask):
+            continue
+        # restrict to HR search range to find f0
+        hr_mask = (freqs >= hr_low) & (freqs <= hr_high)
+        if not np.any(hr_mask):
+            continue
+        hr_idx = np.argmax(P * hr_mask)
+        f0 = freqs[hr_idx]
+        sig_mask = (freqs >= max(getattr(config, 'SNR_BAND_LOW', 0.5), f0 - peak_nb)) & (freqs <= min(getattr(config, 'SNR_BAND_HIGH', 3.0), f0 + peak_nb))
+        noise_mask = band_mask & (~sig_mask)
+        Ps = np.sum(P[sig_mask])
+        Pn = np.mean(P[noise_mask]) if np.any(noise_mask) else eps
+        snr = 10.0 * np.log10((Ps + eps) / (Pn + eps))
+        snrs[c] = np.float32(snr)
+    return snrs
+
 def create_slices(ppg_data, bp_data, sensor_mask):
     """原始的切片方法（保持向后兼容）"""
     if ppg_data.shape[1] < config.WINDOW_SIZE:
@@ -746,6 +793,127 @@ def create_slices(ppg_data, bp_data, sensor_mask):
     
     return ppg_slices, bp_slices, mask_slices
 
+def _estimate_hr_peak_and_peaks(x: np.ndarray, fs: int):
+    """Estimate HR from peaks using scipy.find_peaks on a bandpassed-like signal x.
+    Returns (hr_bpm, peak_indices, peak_count)."""
+    try:
+        if len(x) < max(8, int(0.5 * fs)):
+            return 0.0, np.array([], dtype=int), 0
+        # simple robust thresholds
+        min_dist = int(0.3 * fs)
+        sig = x - np.mean(x)
+        std = np.std(sig) + 1e-6
+        mean = np.mean(sig)
+        candidates = [
+            (mean + 0.2 * std, 0.1 * std),
+            (mean + 0.1 * std, 0.05 * std),
+            (mean, 0.02 * std),
+        ]
+        peaks = np.array([], dtype=int)
+        for h, prom in candidates:
+            peaks, _ = signal.find_peaks(sig, height=h, distance=min_dist, prominence=prom)
+            if len(peaks) >= 3:
+                break
+        if len(peaks) < 2:
+            return 0.0, peaks, len(peaks)
+        peak_times = peaks / fs
+        ibi_ms = np.diff(peak_times) * 1000.0
+        valid = ibi_ms[(ibi_ms >= 300) & (ibi_ms <= 1200)]
+        if len(valid) > 0:
+            hr_bpm = float(np.mean(60000.0 / valid))
+        else:
+            hr_bpm = 0.0
+        return hr_bpm, peaks, len(peaks)
+    except Exception:
+        return 0.0, np.array([], dtype=int), 0
+
+def _estimate_hr_fft(x: np.ndarray, fs: int, min_bpm: int, max_bpm: int):
+    """Estimate HR from FFT peak in [min_bpm, max_bpm] range."""
+    try:
+        if len(x) < max(8, int(0.5 * fs)):
+            return 0.0
+        sig = x - np.mean(x)
+        P = np.abs(np.fft.rfft(sig)) ** 2
+        freqs = np.fft.rfftfreq(len(sig), d=1.0/fs)
+        mask = (freqs > (min_bpm/60.0)) & (freqs < (max_bpm/60.0))
+        if not np.any(mask):
+            return 0.0
+        idx = np.argmax(P * mask)
+        f0 = freqs[idx]
+        return float(f0 * 60.0)
+    except Exception:
+        return 0.0
+
+def _render_subject_overview(best_worst: dict, subject_id: str, split_name: str):
+    """Render a per-subject overview figure with best and worst window per sensor.
+    best_worst: dict[sensor_idx] -> {'best': cand, 'worst': cand}
+    cand contains: signal (1D np.array), fs, peaks (idx array), hr_peak, hr_fft, hr_diff, hr_valid, snr_db, spr, window_sqi, sensor_name, segment
+    """
+    try:
+        num_sensors = len(best_worst)
+        if num_sensors == 0:
+            return
+        cols = 2
+        rows = num_sensors
+        fig, axes = plt.subplots(rows, cols, figsize=(cols*6, max(2*rows, 4)))
+        if rows == 1:
+            axes = np.array([axes])
+        for i in range(num_sensors):
+            row_axes = axes[i]
+            # Best
+            ax = row_axes[0]
+            cand = best_worst[i].get('best', None)
+            ax.set_title('')
+            if cand is not None and isinstance(cand.get('signal', None), np.ndarray) and len(cand['signal']) > 0:
+                sig = cand['signal']
+                fs = cand.get('fs', 30)
+                t = np.arange(len(sig)) / max(fs, 1)
+                sig_plot = (sig - np.mean(sig)) / (np.std(sig) + 1e-6)
+                ax.plot(t, sig_plot, color='#1f77b4', lw=1.0)
+                peaks = cand.get('peaks', np.array([], dtype=int))
+                if peaks is not None and len(peaks) > 0:
+                    ax.scatter(peaks / max(fs, 1), sig_plot[peaks], c='#d62728', s=12, label='peaks')
+                title = f"BEST - {cand.get('sensor_name','sensor')} ({cand.get('segment','')})\n"
+                title += f"SNR {cand.get('snr_db', np.nan):.1f} dB, SQI {cand.get('window_sqi', np.nan):.3f}, HRp {cand.get('hr_peak',0):.0f}/HRf {cand.get('hr_fft',0):.0f}, d {cand.get('hr_diff', np.nan):.1f} bpm"
+                ax.set_title(title, fontsize=9)
+                ax.set_xlabel('Time (s)')
+                ax.set_ylabel(cand.get('sensor_name','sensor'))
+                ax.grid(True, alpha=0.3)
+            else:
+                ax.text(0.5, 0.5, 'No BEST window', ha='center', va='center')
+                ax.axis('off')
+            # Worst
+            ax = row_axes[1]
+            cand = best_worst[i].get('worst', None)
+            ax.set_title('')
+            if cand is not None and isinstance(cand.get('signal', None), np.ndarray) and len(cand['signal']) > 0:
+                sig = cand['signal']
+                fs = cand.get('fs', 30)
+                t = np.arange(len(sig)) / max(fs, 1)
+                sig_plot = (sig - np.mean(sig)) / (np.std(sig) + 1e-6)
+                ax.plot(t, sig_plot, color='#9467bd', lw=1.0)
+                peaks = cand.get('peaks', np.array([], dtype=int))
+                if peaks is not None and len(peaks) > 0:
+                    ax.scatter(peaks / max(fs, 1), sig_plot[peaks], c='#ff7f0e', s=12, label='peaks')
+                title = f"WORST - {cand.get('sensor_name','sensor')} ({cand.get('segment','')})\n"
+                title += f"SNR {cand.get('snr_db', np.nan):.1f} dB, SQI {cand.get('window_sqi', np.nan):.3f}, HRp {cand.get('hr_peak',0):.0f}/HRf {cand.get('hr_fft',0):.0f}, d {cand.get('hr_diff', np.nan):.1f} bpm"
+                ax.set_title(title, fontsize=9)
+                ax.set_xlabel('Time (s)')
+                ax.set_ylabel(cand.get('sensor_name','sensor'))
+                ax.grid(True, alpha=0.3)
+            else:
+                ax.text(0.5, 0.5, 'No WORST window', ha='center', va='center')
+                ax.axis('off')
+        plt.suptitle(f"Subject {subject_id} - {split_name} overview (Best vs Worst per Sensor)", fontsize=12)
+        plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+        out_dir = getattr(config, 'SUBJECT_OVERVIEW_DIR', './')
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, f"{subject_id}_{split_name}_overview.png")
+        plt.savefig(out_path, dpi=200)
+        plt.close(fig)
+    except Exception as e:
+        logging.debug(f"Failed to render subject overview for {subject_id}: {e}")
+
 def main():
     decompress_archives(config.SHARED_DATA_DIR)
     
@@ -755,7 +923,7 @@ def main():
     os.makedirs(config.PROCESSED_DATA_DIR, exist_ok=True)
     
     # Create moved data directory for saving calibrated BP data
-    moved_data_dir = os.path.join(os.path.dirname(config.PROCESSED_DATA_DIR), 'moved')
+    moved_data_dir = getattr(config, 'MOVED_DATA_DIR', os.path.join(os.path.dirname(config.PROCESSED_DATA_DIR), 'moved'))
     os.makedirs(moved_data_dir, exist_ok=True)
     logging.debug(f"Created moved data directory: {moved_data_dir}")
     
@@ -764,14 +932,24 @@ def main():
     for split_name, subjects in subject_splits.items():
         if not subjects:
             continue
-            
+        
         all_ppg_for_split, all_bp_for_split, all_masks_for_split = [], [], []
+        all_sqi_window_for_split, all_sqi_per_channel_for_split = [], []
+        seg1_sqi_window_for_split, seg1_sqi_per_channel_for_split = [], []
+        seg7_sqi_window_for_split, seg7_sqi_per_channel_for_split = [], []
         # Add separate collections for seg1 and seg7
         seg1_ppg_for_split, seg1_bp_for_split, seg1_masks_for_split = [], [], []
         seg7_ppg_for_split, seg7_bp_for_split, seg7_masks_for_split = [], [], []
         
         logging.debug(f"Generating {split_name.upper()} SET")
+        # collectors for per-window detailed SQI export
+        export_rows_all = []
+        export_rows_seg1 = []
+        export_rows_seg7 = []
         for subject_id in tqdm(subjects, desc=f"Processing {split_name} subjects"):
+            # prepare per-subject best/worst window candidates per sensor
+            best_worst = {i: {'best': None, 'worst': None} for i in range(len(config.SENSORS_TO_USE))}
+
             subject_folder = os.path.join(config.RAW_DATA_DIR, subject_id)
             if not os.path.isdir(subject_folder):
                 logging.warning(f"Warning: Directory for subject {subject_id} not found.")
@@ -797,6 +975,205 @@ def main():
                         all_ppg_for_split.extend(ppg_slices)
                         all_bp_for_split.extend(bp_slices)
                         all_masks_for_split.extend(mask_slices)
+
+                        # Phase 2 (record-only): compute SQI per slice if enabled
+                        if getattr(config, 'SQI_REPORT_ONLY', False):
+                            for slice_idx, ppg_slice in enumerate(ppg_slices):
+                                # ppg_slice: (C, L)
+                                C, L = ppg_slice.shape
+                                # Compute simple SQI components per channel
+                                channel_scores = []
+                                # optional: SNR per channel
+                                snr_values = None
+                                if getattr(config, 'SQI_INCLUDE_SNR', False):
+                                    try:
+                                        snr_values = _compute_snr_per_channel(ppg_slice, fs=config.TARGET_SAMPLING_RATE)
+                                    except Exception:
+                                        snr_values = None
+                                for c in range(C):
+                                    x = ppg_slice[c]
+                                    # 1) Amplitude score (robust)
+                                    amp = np.percentile(x, 95) - np.percentile(x, 5)
+                                    amp_score = np.clip(amp / (np.std(x) + 1e-6), 0, 2)
+                                    amp_score = np.clip(amp_score / 2.0, 0, 1)
+                                    # 2) Flatness penalty (lower is better)
+                                    dx = np.diff(x)
+                                    flat_ratio = np.mean(np.abs(dx) < 1e-3)
+                                    flat_score = 1.0 - np.clip(flat_ratio / 0.5, 0, 1)
+                                    # 3) Band energy ratio within [PPG_FILTER_LOW, PPG_FILTER_HIGH]
+                                    fs = config.TARGET_SAMPLING_RATE
+                                    freqs = np.fft.rfftfreq(L, d=1.0/fs)
+                                    X = np.fft.rfft(x - x.mean())
+                                    power = np.abs(X) ** 2
+                                    band_mask = (freqs >= config.PPG_FILTER_LOW) & (freqs <= config.PPG_FILTER_HIGH)
+                                    band_power = power[band_mask].sum() + 1e-8
+                                    total_power = power.sum() + 1e-8
+                                    spr = np.clip(band_power / total_power, 0, 1)
+                                    # 4) Peak detect success ratio (rough)
+                                    try:
+                                        min_dist = int(0.3 * fs)
+                                        peaks, _ = signal.find_peaks(x, distance=min_dist)
+                                        peak_rate = len(peaks) / max(1, (L / fs))  # peaks per second
+                                        # Expected HR in [0.7,3] Hz
+                                        pk_score = 1.0 - np.clip(abs(peak_rate - 1.5) / 1.5, 0, 1)  # center around ~90bpm
+                                    except Exception:
+                                        pk_score = 0.0
+
+                                    # Combine per-channel
+                                    s_c = 0.35*spr + 0.35*amp_score + 0.2*flat_score + 0.1*pk_score
+                                    channel_scores.append(np.clip(s_c, 0, 1))
+
+                                    # HR consistency (per-channel)
+                                    hr_peak_bpm, peak_idx_list, peak_count = _estimate_hr_peak_and_peaks(x, fs)
+                                    hr_fft_bpm = _estimate_hr_fft(x, fs, getattr(config, 'HR_MIN_BPM', 50), getattr(config, 'HR_MAX_BPM', 200))
+                                    hr_diff = float(abs(hr_peak_bpm - hr_fft_bpm)) if (hr_peak_bpm > 0 and hr_fft_bpm > 0) else float('inf')
+                                    hr_valid = (hr_peak_bpm > 0 and hr_fft_bpm > 0 and hr_diff <= getattr(config, 'HR_TOLERANCE_BPM', 5) and peak_count >= getattr(config, 'PEAK_MIN_COUNT', 3))
+
+                                    # update per-subject best/worst candidate for this sensor/channel
+                                    def _candidate_tuple_validity_first(valid, snr, hr_diff, window_sqi):
+                                        return (1 if valid else 0, float(snr) if snr is not None and np.isfinite(snr) else -1e9, -float(hr_diff) if np.isfinite(hr_diff) else -1e9, float(window_sqi))
+                                    def _candidate_tuple_invalid_first(valid, snr, hr_diff, window_sqi):
+                                        return (0 if valid else 1, -(float(snr) if snr is not None and np.isfinite(snr) else -1e9), float(hr_diff) if np.isfinite(hr_diff) else 1e9, -float(window_sqi))
+
+                                    # generate filtered signal for visualization
+                                    try:
+                                        x_f = butter_bandpass_filter(x, config.PPG_FILTER_LOW, config.PPG_FILTER_HIGH, fs, order=3)
+                                    except Exception:
+                                        x_f = x
+
+                                    snr_c = float(snr_values[c]) if (snr_values is not None and np.isfinite(snr_values[c])) else None
+                                    cand = {
+                                        'signal': x_f.astype(float),
+                                        'fs': fs,
+                                        'peaks': peak_idx_list,
+                                        'hr_peak': float(hr_peak_bpm),
+                                        'hr_fft': float(hr_fft_bpm),
+                                        'hr_diff': float(hr_diff) if np.isfinite(hr_diff) else np.nan,
+                                        'hr_valid': bool(hr_valid),
+                                        'snr_db': snr_c if snr_c is not None else np.nan,
+                                        'spr': float(spr),
+                                        'window_sqi': None,  # will fill after window_sqi computed below
+                                        'sensor_idx': c,
+                                        'sensor_name': config.SENSORS_TO_USE[c] if c < len(config.SENSORS_TO_USE) else f'ch{c}',
+                                        'segment': segment,
+                                        'subject_id': subject_id,
+                                    }
+
+                                channel_scores = np.array(channel_scores)
+                                # window score: average over available sensors (mask_slices aligns with ppg_slices)
+                                window_score = float(np.mean(channel_scores[mask_slices[slice_idx]])) if np.any(mask_slices[slice_idx]) else float(np.mean(channel_scores))
+                                all_sqi_per_channel_for_split.append(channel_scores.astype(np.float32))
+                                all_sqi_window_for_split.append(window_score)
+                                if segment == 'seg1':
+                                    seg1_sqi_per_channel_for_split.append(channel_scores.astype(np.float32))
+                                    seg1_sqi_window_for_split.append(window_score)
+                                elif segment == 'seg7':
+                                    seg7_sqi_per_channel_for_split.append(channel_scores.astype(np.float32))
+                                    seg7_sqi_window_for_split.append(window_score)
+
+                                # export per-window, per-channel SQI detail rows
+                                if getattr(config, 'SQI_EXPORT_DETAIL', False):
+                                    # for each channel, write a row with components and SNR
+                                    for c in range(C):
+                                        row = {
+                                            'split': split_name,
+                                            'subject_id': subject_id,
+                                            'segment': segment,
+                                            'window_idx': len(all_sqi_window_for_split)-1,
+                                            'channel_idx': c,
+                                            'channel_name': config.SENSORS_TO_USE[c] if c < len(config.SENSORS_TO_USE) else f'ch{c}',
+                                            'available': bool(mask_slices[slice_idx][c]) if c < len(mask_slices[slice_idx]) else True,
+                                            'window_sqi': window_score,
+                                            # component placeholders to be filled below
+                                        }
+                                        # Recompute component pieces for export (cheap)
+                                        x = ppg_slice[c]
+                                        amp = float(np.percentile(x, 95) - np.percentile(x, 5))
+                                        dx = np.diff(x)
+                                        flat_ratio = float(np.mean(np.abs(dx) < 1e-3))
+                                        fs = config.TARGET_SAMPLING_RATE
+                                        freqs = np.fft.rfftfreq(L, d=1.0/fs)
+                                        X = np.fft.rfft(x - x.mean())
+                                        power = np.abs(X) ** 2
+                                        band_mask = (freqs >= config.PPG_FILTER_LOW) & (freqs <= config.PPG_FILTER_HIGH)
+                                        band_power = float(power[band_mask].sum())
+                                        total_power = float(power.sum())
+                                        row.update({
+                                            'amp': amp,
+                                            'flat_ratio': flat_ratio,
+                                            'band_power': band_power,
+                                            'total_power': total_power,
+                                            'spr': float(np.clip(band_power / (total_power + 1e-8), 0, 1)),
+                                        })
+                                        if getattr(config, 'SQI_INCLUDE_SNR', False) and snr_values is not None:
+                                            row['snr_db'] = float(snr_values[c]) if np.isfinite(snr_values[c]) else np.nan
+                                        # HR fields
+                                        hr_peak_bpm, peak_idx_list, peak_count = _estimate_hr_peak_and_peaks(x, fs)
+                                        hr_fft_bpm = _estimate_hr_fft(x, fs, getattr(config, 'HR_MIN_BPM', 50), getattr(config, 'HR_MAX_BPM', 200))
+                                        hr_diff = float(abs(hr_peak_bpm - hr_fft_bpm)) if (hr_peak_bpm > 0 and hr_fft_bpm > 0) else np.nan
+                                        hr_valid = (hr_peak_bpm > 0 and hr_fft_bpm > 0 and (abs(hr_peak_bpm - hr_fft_bpm) <= getattr(config, 'HR_TOLERANCE_BPM', 5)) and peak_count >= getattr(config, 'PEAK_MIN_COUNT', 3))
+                                        row.update({
+                                            'peak_hr_bpm': float(hr_peak_bpm),
+                                            'fft_hr_bpm': float(hr_fft_bpm),
+                                            'hr_diff_bpm': hr_diff if np.isfinite(hr_diff) else np.nan,
+                                            'hr_valid': bool(hr_valid),
+                                            'peak_count': int(peak_count),
+                                        })
+                                        export_rows_all.append(row)
+                                        if segment == 'seg1':
+                                            export_rows_seg1.append(row.copy())
+                                        elif segment == 'seg7':
+                                            export_rows_seg7.append(row.copy())
+
+                                    # After export rows, update best/worst with finalized window score
+                                    for c in range(C):
+                                        # skip channels not available in this window
+                                        if c >= len(mask_slices[slice_idx]) or (not bool(mask_slices[slice_idx][c])):
+                                            continue
+                                        snr_c = float(snr_values[c]) if (snr_values is not None and np.isfinite(snr_values[c])) else np.nan
+                                        x = ppg_slice[c]
+                                        hr_peak_bpm, peak_idx_list, peak_count = _estimate_hr_peak_and_peaks(x, fs)
+                                        hr_fft_bpm = _estimate_hr_fft(x, fs, getattr(config, 'HR_MIN_BPM', 50), getattr(config, 'HR_MAX_BPM', 200))
+                                        hr_diff = float(abs(hr_peak_bpm - hr_fft_bpm)) if (hr_peak_bpm > 0 and hr_fft_bpm > 0) else np.inf
+                                        hr_valid = (hr_peak_bpm > 0 and hr_fft_bpm > 0 and hr_diff <= getattr(config, 'HR_TOLERANCE_BPM', 5) and peak_count >= getattr(config, 'PEAK_MIN_COUNT', 3))
+                                        try:
+                                            x_f = butter_bandpass_filter(x, config.PPG_FILTER_LOW, config.PPG_FILTER_HIGH, fs, order=3)
+                                        except Exception:
+                                            x_f = x
+                                        # recompute band/total power for spr
+                                        freqs = np.fft.rfftfreq(L, d=1.0/fs)
+                                        X = np.fft.rfft(x - np.mean(x))
+                                        power = np.abs(X) ** 2
+                                        band_mask = (freqs >= config.PPG_FILTER_LOW) & (freqs <= config.PPG_FILTER_HIGH)
+                                        band_power = float(power[band_mask].sum())
+                                        total_power = float(power.sum()) + 1e-8
+                                        cand = {
+                                            'signal': x_f.astype(float),
+                                            'fs': fs,
+                                            'peaks': peak_idx_list,
+                                            'hr_peak': float(hr_peak_bpm),
+                                            'hr_fft': float(hr_fft_bpm),
+                                            'hr_diff': float(hr_diff) if np.isfinite(hr_diff) else np.nan,
+                                            'hr_valid': bool(hr_valid),
+                                            'snr_db': snr_c,
+                                            'spr': float(np.clip(band_power / total_power, 0, 1)),
+                                            'window_sqi': float(window_score),
+                                            'sensor_idx': c,
+                                            'sensor_name': config.SENSORS_TO_USE[c] if c < len(config.SENSORS_TO_USE) else f'ch{c}',
+                                            'segment': segment,
+                                            'subject_id': subject_id,
+                                        }
+                                        # compare and update best/worst
+                                        cur_best = best_worst[c]['best']
+                                        cur_worst = best_worst[c]['worst']
+                                        def key_best(obj):
+                                            return (1 if obj['hr_valid'] else 0, float(obj['snr_db']) if np.isfinite(obj['snr_db']) else -1e9, -float(obj['hr_diff']) if np.isfinite(obj['hr_diff']) else -1e9, float(obj['window_sqi']))
+                                        def key_worst(obj):
+                                            return (0 if obj['hr_valid'] else 1, -(float(obj['snr_db']) if np.isfinite(obj['snr_db']) else -1e9), float(obj['hr_diff']) if np.isfinite(obj['hr_diff']) else 1e9, -float(obj['window_sqi']))
+                                        if cur_best is None or key_best(cand) > key_best(cur_best):
+                                            best_worst[c]['best'] = cand
+                                        if cur_worst is None or key_worst(cand) > key_worst(cur_worst):
+                                            best_worst[c]['worst'] = cand
                         
                         # Add to segment-specific datasets
                         if segment == 'seg1':
@@ -814,6 +1191,10 @@ def main():
                 else:
                     logging.debug(f"No data processed for {segment}")
 
+            # After both segments processed for this subject, render overview if enabled
+            if getattr(config, 'SQI_SUBJECT_OVERVIEW', False):
+                _render_subject_overview(best_worst, subject_id=subject_id, split_name=split_name)
+
         # Save combined dataset (existing logic)
         if not all_ppg_for_split:
             logging.debug(f"No data generated for {split_name} set.")
@@ -822,6 +1203,8 @@ def main():
         all_ppg_np = np.array(all_ppg_for_split, dtype=np.float32)
         all_bp_np = np.array(all_bp_for_split, dtype=np.float32)
         all_masks_np = np.array(all_masks_for_split, dtype=bool)
+        all_sqi_win_np = np.array(all_sqi_window_for_split, dtype=np.float32) if all_sqi_window_for_split else None
+        all_sqi_ch_np = np.array(all_sqi_per_channel_for_split, dtype=np.float32) if all_sqi_per_channel_for_split else None
         
         logging.debug(f"Generated {len(all_ppg_np)} samples for {split_name} set (combined)")
         logging.debug(f"PPG shape: {all_ppg_np.shape}, BP shape: {all_bp_np.shape}, Mask shape: {all_masks_np.shape}")
@@ -832,8 +1215,40 @@ def main():
             logging.debug(f"  {sensor} availability: {sensor_availability[i]*100:.1f}%")
         
         save_path_npz = os.path.join(config.PROCESSED_DATA_DIR, f"{split_name}_data.npz")
-        np.savez(save_path_npz, ppg=all_ppg_np, bp=all_bp_np, sensor_mask=all_masks_np)
+        if getattr(config, 'SQI_REPORT_ONLY', False) and (all_sqi_win_np is not None):
+            np.savez(save_path_npz, ppg=all_ppg_np, bp=all_bp_np, sensor_mask=all_masks_np,
+                     sqi_window=all_sqi_win_np, sqi_per_channel=all_sqi_ch_np)
+        else:
+            np.savez(save_path_npz, ppg=all_ppg_np, bp=all_bp_np, sensor_mask=all_masks_np)
         logging.debug(f"Saved combined dataset to {save_path_npz}")
+
+        # Write detailed CSV exports if requested
+        if getattr(config, 'SQI_EXPORT_DETAIL', False) and export_rows_all:
+            os.makedirs(getattr(config, 'SQI_REPORT_DIR', './'), exist_ok=True)
+            def _write_csv(rows, path):
+                fieldnames = ['split','subject_id','segment','window_idx','channel_idx','channel_name','available','window_sqi','amp','flat_ratio','band_power','total_power','spr','peak_hr_bpm','fft_hr_bpm','hr_diff_bpm','hr_valid','peak_count']
+                if getattr(config, 'SQI_INCLUDE_SNR', False):
+                    fieldnames.append('snr_db')
+                with open(path, 'w', newline='') as f:
+                    w = csv.DictWriter(f, fieldnames=fieldnames)
+                    w.writeheader()
+                    for r in rows:
+                        w.writerow(r)
+            base = getattr(config, 'SQI_REPORT_DIR', './')
+            _write_csv(export_rows_all, os.path.join(base, f'sqi_detail_{split_name}.csv'))
+            if export_rows_seg1:
+                _write_csv(export_rows_seg1, os.path.join(base, f'sqi_detail_{split_name}_seg1.csv'))
+            if export_rows_seg7:
+                _write_csv(export_rows_seg7, os.path.join(base, f'sqi_detail_{split_name}_seg7.csv'))
+
+        # After finishing this split, also render per-subject best/worst overview figures if enabled
+        if getattr(config, 'SQI_SUBJECT_OVERVIEW', False):
+            try:
+                os.makedirs(getattr(config, 'SUBJECT_OVERVIEW_DIR', './'), exist_ok=True)
+            except Exception:
+                pass
+            # We rendered per subject inside the loop; ensure any remaining subject best/worst are saved
+        
 
         # Save seg1-only dataset
         if seg1_ppg_for_split:
@@ -844,7 +1259,11 @@ def main():
             logging.debug(f"Generated {len(seg1_ppg_np)} samples for {split_name} set (seg1 only)")
             
             seg1_save_path = os.path.join(config.PROCESSED_DATA_DIR, f"{split_name}_seg1_data.npz")
-            np.savez(seg1_save_path, ppg=seg1_ppg_np, bp=seg1_bp_np, sensor_mask=seg1_masks_np)
+            if getattr(config, 'SQI_REPORT_ONLY', False) and (all_sqi_win_np is not None):
+                # Extract corresponding portion for seg1 by index mapping would require tracking; omit here to avoid mismatch
+                np.savez(seg1_save_path, ppg=seg1_ppg_np, bp=seg1_bp_np, sensor_mask=seg1_masks_np)
+            else:
+                np.savez(seg1_save_path, ppg=seg1_ppg_np, bp=seg1_bp_np, sensor_mask=seg1_masks_np)
             logging.debug(f"Saved seg1 dataset to {seg1_save_path}")
         
         # Save seg7-only dataset
@@ -856,17 +1275,20 @@ def main():
             logging.debug(f"Generated {len(seg7_ppg_np)} samples for {split_name} set (seg7 only)")
             
             seg7_save_path = os.path.join(config.PROCESSED_DATA_DIR, f"{split_name}_seg7_data.npz")
-            np.savez(seg7_save_path, ppg=seg7_ppg_np, bp=seg7_bp_np, sensor_mask=seg7_masks_np)
+            if getattr(config, 'SQI_REPORT_ONLY', False) and (all_sqi_win_np is not None):
+                np.savez(seg7_save_path, ppg=seg7_ppg_np, bp=seg7_bp_np, sensor_mask=seg7_masks_np)
+            else:
+                np.savez(seg7_save_path, ppg=seg7_ppg_np, bp=seg7_bp_np, sensor_mask=seg7_masks_np)
             logging.debug(f"Saved seg7 dataset to {seg7_save_path}")
 
         NUM_SAMPLES_TO_SAVE = 5
-        csv_sample_dir = os.path.join(config.PROCESSED_DATA_DIR, f"{split_name}_csv_samples")
+        csv_sample_dir = os.path.join(config.RESULTS_DIR, f"{split_name}_csv_samples")
         os.makedirs(csv_sample_dir, exist_ok=True)
         
         num_total_samples = len(all_ppg_np)
         sample_indices = np.random.choice(num_total_samples, size=min(NUM_SAMPLES_TO_SAVE, num_total_samples), replace=False)
         
-        for i, idx in enumerate(sample_indices):
+    for i, idx in enumerate(sample_indices):
             ppg_sample = all_ppg_np[idx]
             mask_sample = all_masks_np[idx]
             
@@ -919,6 +1341,49 @@ def main():
         seg7_path = os.path.join(config.PROCESSED_DATA_DIR, f"{split_name}_seg7_data.npz")
         if os.path.exists(seg7_path):
             print(f"  {split_name}_seg7_data.npz (seg7 only)")
+
+    # Save SQI reports (overall + seg-specific) if computed
+    if getattr(config, 'SQI_REPORT_ONLY', False):
+        try:
+            os.makedirs(getattr(config, 'SQI_REPORT_DIR', './'), exist_ok=True)
+            import json
+
+            def _save_sqi_report(sqi_list, tag):
+                if not sqi_list:
+                    return
+                report = {
+                    'split': split_name,
+                    'tag': tag,
+                    'num_samples': len(sqi_list),
+                    'sqi_window_mean': float(np.mean(sqi_list)),
+                    'sqi_window_median': float(np.median(sqi_list)),
+                    'sqi_window_p10': float(np.percentile(sqi_list, 10)),
+                    'sqi_window_p25': float(np.percentile(sqi_list, 25)),
+                    'sqi_window_p75': float(np.percentile(sqi_list, 75)),
+                    'sqi_window_p90': float(np.percentile(sqi_list, 90)),
+                }
+                base = getattr(config, 'SQI_REPORT_DIR', './')
+                report_path = os.path.join(base, f'sqi_summary_{split_name}{("_"+tag) if tag else ""}.json')
+                with open(report_path, 'w', encoding='utf-8') as f:
+                    json.dump(report, f, ensure_ascii=False, indent=2)
+
+                # Histogram
+                plt.figure(figsize=(6,4))
+                plt.hist(sqi_list, bins=30, color='#2a9d8f', alpha=0.85)
+                plt.title(f'Window SQI Distribution ({split_name}{"/"+tag if tag else ""})')
+                plt.xlabel('SQI')
+                plt.ylabel('Count')
+                plt.grid(True, alpha=0.3)
+                plt.tight_layout()
+                plt.savefig(os.path.join(base, f'sqi_window_hist_{split_name}{("_"+tag) if tag else ""}.png'), dpi=200)
+                plt.close()
+
+            _save_sqi_report(all_sqi_window_for_split, tag="")
+            _save_sqi_report(seg1_sqi_window_for_split, tag="seg1")
+            _save_sqi_report(seg7_sqi_window_for_split, tag="seg7")
+
+        except Exception as e:
+            logging.debug(f"SQI report saving failed: {e}")
 
 if __name__ == "__main__":
     main()
