@@ -1,33 +1,33 @@
 import sys
 import os
 
-# Add project root to Python path
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, project_root)
+# Ensure the repo root (folder containing config.py) is on sys.path
+repo_root = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, repo_root)
 
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.signal import find_peaks
 from sklearn.metrics import mean_absolute_error, r2_score
 import config
 from data.dataset import PPGDataset
 from model.model import UNet1D
 from loss.trend_loss import CombinedBPAttentionLoss
 import glob
+import argparse
 
-import swanlab
-
-import random
-
-def set_seed(seed: int):
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+try:
+    import swanlab
+except Exception:
+    class _SwanStub:
+        def init(self, **kwargs):
+            print("[swanlab stub] init", kwargs)
+        def log(self, data):
+            pass
+        class Image:
+            def __init__(self, path):
+                self.path = path
+    swanlab = _SwanStub()
 
 
 def calculate_metrics(y_true, y_pred):
@@ -49,94 +49,10 @@ def calculate_metrics(y_true, y_pred):
     }
 
 
-def _segment_beats_by_valleys(bp_signal: np.ndarray, fs: int):
-    """Use minima (valleys) to segment beats on BP signal. Returns list of (start, end) indices per beat."""
-    if len(bp_signal) < fs:
-        return []
-    # Invert to find valleys as peaks
-    inv = -bp_signal
-    min_distance = max(1, int(0.3 * fs))  # ~300 ms
-    valleys, _ = find_peaks(inv, distance=min_distance)
-    beats = []
-    for i in range(len(valleys) - 1):
-        s, e = valleys[i], valleys[i+1]
-        if e > s + 5:
-            beats.append((s, e))
-    return beats
-
-
-def calculate_clinical_metrics(y_true: np.ndarray, y_pred: np.ndarray, fs: int):
-    """Compute beat-level clinical metrics: SBP/DBP/MAP MAE, BHS proportions, AAMI bias/SD."""
-    beats = _segment_beats_by_valleys(y_true, fs)
-    if not beats:
-        return {
-            'SBP_MAE': np.nan, 'DBP_MAE': np.nan, 'MAP_MAE': np.nan,
-            'BHS_SBP_<=5': np.nan, 'BHS_SBP_<=10': np.nan, 'BHS_SBP_<=15': np.nan,
-            'BHS_DBP_<=5': np.nan, 'BHS_DBP_<=10': np.nan, 'BHS_DBP_<=15': np.nan,
-            'AAMI_SBP_bias': np.nan, 'AAMI_SBP_SD': np.nan,
-            'AAMI_DBP_bias': np.nan, 'AAMI_DBP_SD': np.nan,
-        }
-    sbp_true, dbp_true, map_true = [], [], []
-    sbp_pred, dbp_pred, map_pred = [], [], []
-    for s, e in beats:
-        t_seg = y_true[s:e]
-        p_seg = y_pred[s:e]
-        if len(t_seg) < 3 or len(p_seg) < 3:
-            continue
-        sbp_true.append(np.max(t_seg)); sbp_pred.append(np.max(p_seg))
-        dbp_true.append(np.min(t_seg)); dbp_pred.append(np.min(p_seg))
-        # MAP approximate: mean over beat
-        map_true.append(np.mean(t_seg)); map_pred.append(np.mean(p_seg))
-    if len(sbp_true) == 0:
-        return {
-            'SBP_MAE': np.nan, 'DBP_MAE': np.nan, 'MAP_MAE': np.nan,
-            'BHS_SBP_<=5': np.nan, 'BHS_SBP_<=10': np.nan, 'BHS_SBP_<=15': np.nan,
-            'BHS_DBP_<=5': np.nan, 'BHS_DBP_<=10': np.nan, 'BHS_DBP_<=15': np.nan,
-            'AAMI_SBP_bias': np.nan, 'AAMI_SBP_SD': np.nan,
-            'AAMI_DBP_bias': np.nan, 'AAMI_DBP_SD': np.nan,
-        }
-    sbp_true = np.array(sbp_true); sbp_pred = np.array(sbp_pred)
-    dbp_true = np.array(dbp_true); dbp_pred = np.array(dbp_pred)
-    map_true = np.array(map_true); map_pred = np.array(map_pred)
-
-    sbp_err = sbp_pred - sbp_true
-    dbp_err = dbp_pred - dbp_true
-    map_err = map_pred - map_true
-
-    def bhs_props(err):
-        abs_e = np.abs(err)
-        return (
-            np.mean(abs_e <= 5.0),
-            np.mean(abs_e <= 10.0),
-            np.mean(abs_e <= 15.0),
-        )
-
-    sbp_mae = float(np.mean(np.abs(sbp_err)))
-    dbp_mae = float(np.mean(np.abs(dbp_err)))
-    map_mae = float(np.mean(np.abs(map_err)))
-    sbp_bhs = bhs_props(sbp_err)
-    dbp_bhs = bhs_props(dbp_err)
-    sbp_bias, sbp_sd = float(np.mean(sbp_err)), float(np.std(sbp_err, ddof=1))
-    dbp_bias, dbp_sd = float(np.mean(dbp_err)), float(np.std(dbp_err, ddof=1))
-
-    return {
-        'SBP_MAE': sbp_mae,
-        'DBP_MAE': dbp_mae,
-        'MAP_MAE': map_mae,
-        'BHS_SBP_<=5': sbp_bhs[0], 'BHS_SBP_<=10': sbp_bhs[1], 'BHS_SBP_<=15': sbp_bhs[2],
-        'BHS_DBP_<=5': dbp_bhs[0], 'BHS_DBP_<=10': dbp_bhs[1], 'BHS_DBP_<=15': dbp_bhs[2],
-        'AAMI_SBP_bias': sbp_bias, 'AAMI_SBP_SD': sbp_sd,
-        'AAMI_DBP_bias': dbp_bias, 'AAMI_DBP_SD': dbp_sd,
-    }
-
-
 def evaluate_model_on_dataset(model, dataset, device):
     """Evaluate a single model on the entire dataset and return average metrics"""
     model.eval()
     all_metrics = []
-    all_clinical = []
-    all_clinical = []
-    all_clinical = []
     
     with torch.no_grad():
         for i in range(len(dataset)):
@@ -157,16 +73,14 @@ def evaluate_model_on_dataset(model, dataset, device):
             bp_pred_np = bp_pred.squeeze().cpu().numpy()
             
             metrics = calculate_metrics(bp_true_np, bp_pred_np)
-            clinical = calculate_clinical_metrics(bp_true_np, bp_pred_np, fs=config.TARGET_SAMPLING_RATE)
             all_metrics.append(metrics)
-            all_clinical.append(clinical)
     
     # Calculate average metrics
     avg_metrics = {key: np.mean([m[key] for m in all_metrics]) for key in all_metrics[0]}
     return avg_metrics
 
 
-def evaluate_and_plot(model, device, model_name, num_samples=5):
+def evaluate_and_plot(model, device, model_name, results_dir, num_samples=5):
     print(f"Loading test dataset for evaluation of {model_name}...")
     test_dataset_path = os.path.join(config.PROCESSED_DATA_DIR, "test_data.npz")
     if not os.path.exists(test_dataset_path):
@@ -181,7 +95,6 @@ def evaluate_and_plot(model, device, model_name, num_samples=5):
     model.eval()
     
     all_metrics = []
-    all_clinical = []
     
     if len(test_dataset) > num_samples:
         sample_indices = np.random.choice(len(test_dataset), size=num_samples, replace=False)
@@ -209,9 +122,7 @@ def evaluate_and_plot(model, device, model_name, num_samples=5):
             bp_pred_np = bp_pred.squeeze().cpu().numpy()
             
             metrics = calculate_metrics(bp_true_np, bp_pred_np)
-            clinical = calculate_clinical_metrics(bp_true_np, bp_pred_np, fs=config.TARGET_SAMPLING_RATE)
             all_metrics.append(metrics)
-            all_clinical.append(clinical)
             
             if i in sample_indices:
                 plot_idx = np.where(sample_indices == i)[0][0]
@@ -227,35 +138,37 @@ def evaluate_and_plot(model, device, model_name, num_samples=5):
         return None
 
     avg_metrics = {key: np.mean([m[key] for m in all_metrics]) for key in all_metrics[0]}
-    if all_clinical:
-        avg_clinical = {key: float(np.nanmean([c[key] for c in all_clinical])) for key in all_clinical[0].keys()}
-    else:
-        avg_clinical = None
+    
     print(f"\n=== EVALUATION SUMMARY for {model_name} ===")
     print(f"Metrics averaged over the entire test set ({len(test_dataset)} samples).")
     print("\nPerformance Metrics:")
     for key, value in avg_metrics.items():
         print(f"  {key}: {value:.4f}")
-    if avg_clinical is not None:
-        print("\nClinical Metrics (beat-level):")
-        for key, value in avg_clinical.items():
-            print(f"  {key}: {value:.4f}")
 
     plt.tight_layout()
-    os.makedirs(config.RESULTS_DIR, exist_ok=True)
+    os.makedirs(results_dir, exist_ok=True)
     safe_model_name = model_name.replace("/", "_").replace("\\", "_")
-    save_path = os.path.join(config.RESULTS_DIR, f"evaluation_{safe_model_name}_plots.png")
+    save_path = os.path.join(results_dir, f"evaluation_{safe_model_name}_plots.png")
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     print(f"\nEvaluation plot saved to {save_path}")
     plt.close()
     
-    return (avg_metrics if avg_metrics else None, avg_clinical, save_path)
+    return avg_metrics, save_path
 
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    set_seed(getattr(config, "SEED", 42))
+
+    # CLI args
+    parser = argparse.ArgumentParser(description="Evaluate saved PPG2BP models")
+    parser.add_argument("--models_dir", type=str, default=config.SAVED_MODELS_DIR,
+                        help="Directory containing model .pth files (default: config.SAVED_MODELS_DIR)")
+    parser.add_argument("--results_dir", type=str, default=config.RESULTS_DIR,
+                        help="Directory to write evaluation plots and reports (default: config.RESULTS_DIR)")
+    parser.add_argument("--num_samples", type=int, default=5,
+                        help="Number of samples to visualize")
+    args = parser.parse_args()
 
     swanlab.init(
         project="ppg2bp-evaluation",
@@ -265,13 +178,13 @@ def main():
     # NEW: Find all available model files
     model_files = []
     
-    # Add best model
-    best_model_path = os.path.join(config.SAVED_MODELS_DIR, "best_model.pth")
+    # Add best model (use config path)
+    best_model_path = os.path.join(args.models_dir, "best_model.pth")
     if os.path.exists(best_model_path):
         model_files.append(("best_model", best_model_path))
     
     # Add epoch models (5, 10, 15, etc.)
-    epoch_model_pattern = os.path.join(config.SAVED_MODELS_DIR, "model_epoch_*.pth")
+    epoch_model_pattern = os.path.join(args.models_dir, "model_epoch_*.pth")
     epoch_models = glob.glob(epoch_model_pattern)
     
     for epoch_model_path in sorted(epoch_models):
@@ -318,16 +231,14 @@ def main():
             continue
         
         # Evaluate model
-        result = evaluate_and_plot(model, device, model_name, num_samples=5)
+        result = evaluate_and_plot(model, device, model_name, results_dir=args.results_dir, num_samples=args.num_samples)
         if result is not None:
-            avg_metrics, avg_clinical, plot_path = result
+            avg_metrics, plot_path = result
             all_results[model_name] = avg_metrics
             
             # Log to swanlab with model-specific prefix
             swanlab_metrics = {f"{model_name}/{key}": value for key, value in avg_metrics.items()}
             swanlab.log(swanlab_metrics)
-            if avg_clinical is not None:
-                swanlab.log({f"{model_name}/clinical_{k}": v for k, v in avg_clinical.items()})
             swanlab.log({f"{model_name}/plot": swanlab.Image(plot_path)})
     
     # NEW: Create comparison plot and summary
@@ -391,7 +302,7 @@ def main():
             ax.legend()
         
         plt.tight_layout()
-        comparison_plot_path = os.path.join(config.RESULTS_DIR, "model_comparison_across_epochs.png")
+        comparison_plot_path = os.path.join(args.results_dir, "model_comparison_across_epochs.png")
         plt.savefig(comparison_plot_path, dpi=300, bbox_inches='tight')
         plt.close()
         print(f"\nComparison plot saved to {comparison_plot_path}")
@@ -399,7 +310,7 @@ def main():
         swanlab.log({"comparison/plot": swanlab.Image(comparison_plot_path)})
         
         # Save detailed comparison report
-        report_path = os.path.join(config.RESULTS_DIR, "multi_epoch_evaluation_report.txt")
+        report_path = os.path.join(args.results_dir, "multi_epoch_evaluation_report.txt")
         with open(report_path, 'w', encoding='utf-8') as f:
             f.write("Multi-Epoch Model Evaluation Report\n")
             f.write("=" * 40 + "\n\n")
@@ -427,7 +338,7 @@ def main():
                     best_model = max(all_results.items(), key=lambda x: x[1][metric])
                     f.write(f"Best {metric}: {best_model[0]} ({best_model[1][metric]:.4f})\n")
         
-        print(f"Detailed comparison report saved to {report_path}")
+    print(f"Detailed comparison report saved to {report_path}")
     
     print(f"\nEvaluation complete! Evaluated {len(all_results)} models.")
 
