@@ -21,10 +21,9 @@ LOG_DIR = os.path.join(OUTPUT_BASE, "logs/")
 MOVED_DATA_DIR = os.path.join(OUTPUT_BASE, "moved/")
 SQI_REPORT_DIR = os.path.join(OUTPUT_BASE, "sqi_reports/")
 SUBJECT_OVERVIEW_DIR = os.path.join(OUTPUT_BASE, "subject_overviews/")
-RUNS_DIR = os.path.join(OUTPUT_BASE, "runs/")  # each training run will be placed under runs/<run_name_timestamp>/
 
 # Ensure directories exist at import time (safe-guard)
-for _d in [RAW_DATA_DIR, PROCESSED_DATA_DIR, RESULTS_DIR, SAVED_MODELS_DIR, LOG_DIR, MOVED_DATA_DIR, SQI_REPORT_DIR, SUBJECT_OVERVIEW_DIR, RUNS_DIR]:
+for _d in [RAW_DATA_DIR, PROCESSED_DATA_DIR, RESULTS_DIR, SAVED_MODELS_DIR, LOG_DIR, MOVED_DATA_DIR, SQI_REPORT_DIR, SUBJECT_OVERVIEW_DIR]:
 	try:
 		os.makedirs(_d, exist_ok=True)
 	except Exception:
@@ -58,10 +57,6 @@ BP_FILTER_HIGH = 3
 PPG_FILTER_LOW = 0.5  
 PPG_FILTER_HIGH = 3.0 
 
-# -------- Input normalization options --------
-PPG_NORM_MODE = 'zscore'     # 'none' | 'zscore'（按窗口逐通道标准化）
-PPG_NORM_EPS = 1e-6          # 防止除零的小常数
-
 OMRON_CSV_PATH = "./data/omron.csv" 
 BP_CORRECTION_THRESHOLD = 10 
 PULSE_PRESSURE_DIFF_THRESHOLD = 10.0
@@ -72,15 +67,14 @@ SBP_DBP_MODE = "mse"   # one of: "mse", "huber", "mix"
 HUBER_DELTA = 1.0       # huber threshold (mmHg)
 MIX_ALPHA = 0.5         # weight for MSE in MSE+MAE mix
 
-# -------- SQI options (training-time consistency control) --------
-USE_SQI = True                # enable TD–FD consistency weighting in training
-SQI_STRATEGY = "pf"          # 'pf': |HR_time - HR_freq| (recommended); 'pt': reserved for true-HR
-SQI_REPORT_ONLY = True        # preprocess-only reporting flag (kept for compatibility)
-SQI_MODE = "weight"          # 'weight' or 'filter'
-SQI_THRESHOLD = 0.4           # sample kept if weight>=threshold when mode='filter'
-CHANNEL_SQI_THRESHOLD = 0.5   # preprocess-only per-channel threshold (kept for compatibility)
-CHANNEL_PASS_K = 2            # top-k channels used to form a sample weight
-SAMPLE_WEIGHT_MIN = 0.2       # minimal sample weight in 'weight' mode
+# -------- SQI options (record-only by default; no behavior change) --------
+USE_SQI = False               # enable SQI in dataset/loss; when False, behavior unchanged
+SQI_REPORT_ONLY = True        # if True, just compute & save SQI stats during preprocess, no filtering/weighting
+SQI_MODE = "weight"          # "weight" or "filter" (ignored when SQI_REPORT_ONLY=True)
+SQI_THRESHOLD = 0.4           # window-level threshold for filter mode
+CHANNEL_SQI_THRESHOLD = 0.5   # per-channel threshold for masking in a window
+CHANNEL_PASS_K = 2            # require at least K channels passing to keep a window
+SAMPLE_WEIGHT_MIN = 0.2       # min sample weight when using weight mode
 
 # -------- SQI detailed export options --------
 # Export per-window, per-channel SQI components into CSV for analysis (no behavior change)
@@ -100,7 +94,3 @@ HR_MAX_BPM = 200
 HR_TOLERANCE_BPM = 5                # |HR_peak - HR_fft| <= tolerance -> valid
 PEAK_MIN_COUNT = 3                  # minimal peaks within a window to trust HR
 SQI_SUBJECT_OVERVIEW = True         # render per-subject best/worst window figure
-
-# -------- Training-time SQI export (debug) --------
-SQI_DUMP_CSV = False                # 训练/验证时导出每样本的 HR_td/HR_fd/Δ/权重 明细
-SQI_DUMP_MAX_SAMPLES = 2000         # 每个 split 每个 epoch 最多导出的样本数，避免过大文件
