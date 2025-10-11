@@ -61,7 +61,7 @@ def _weights_from_ppg_consistency(ppg: torch.Tensor,
                                   mode: str = 'weight',
                                   threshold: float = 0.4,
                                   min_weight: float = 0.2,
-                                  alpha_bpm: float = 8.0) -> torch.Tensor:
+                                  alpha_bpm: float = 5.0) -> torch.Tensor:
     """
     Compute per-sample weights from PPG HR consistency.
     strategy:
@@ -98,6 +98,8 @@ def _weights_from_ppg_consistency(ppg: torch.Tensor,
                 q[b, c] = 0.0
             else:
                 q[b, c] = float(np.exp(-delta / max(alpha_bpm, 1e-6)))
+                # val = 1.0 - (delta / max(alpha_bpm, 1e-6)) ** 2
+                # q[b, c] = float(val) if val > 0.0 else 0.0
 
     # top-k channel averaging
     k_eff = max(1, min(int(topk), C))

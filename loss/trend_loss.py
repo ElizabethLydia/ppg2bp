@@ -69,7 +69,8 @@ class CombinedBPAttentionLoss(nn.Module):
             while sample_weight.dim() < keypoint_loss_pw.dim():
                 sample_weight = sample_weight.unsqueeze(-1)
             # normalize by mean weight to keep loss scale
-            sbp_dbp_loss = (keypoint_loss_pw * sample_weight).mean() / (sample_weight.mean() + 1e-8)
+            # sbp_dbp_loss = (keypoint_loss_pw * sample_weight).mean() / (sample_weight.mean() + 1e-8)
+            sbp_dbp_loss = (keypoint_loss_pw * sample_weight).mean()
         else:
             sbp_dbp_loss = keypoint_loss_pw.mean()
 
@@ -79,7 +80,8 @@ class CombinedBPAttentionLoss(nn.Module):
         
         trend_pw = 1.0 - F.cosine_similarity(y_pred_centered, y_true_centered, dim=2)
         if sample_weight is not None:
-            trend_loss = (trend_pw * sample_weight.squeeze()).mean() / (sample_weight.mean() + 1e-8)
+            # trend_loss = (trend_pw * sample_weight.squeeze()).mean() / (sample_weight.mean() + 1e-8)
+            trend_loss = (trend_pw * sample_weight.squeeze()).mean()
         else:
             trend_loss = trend_pw.mean()
 
@@ -92,7 +94,8 @@ class CombinedBPAttentionLoss(nn.Module):
         
         notch_pw = pointwise_mse_notch * notch_attention
         if sample_weight is not None:
-            notch_loss = (notch_pw * sample_weight.unsqueeze(-1)).mean() / (sample_weight.mean() + 1e-8)
+            # notch_loss = (notch_pw * sample_weight.unsqueeze(-1)).mean() / (sample_weight.mean() + 1e-8)
+            notch_loss = (notch_pw * sample_weight.unsqueeze(-1)).mean()
         else:
             notch_loss = notch_pw.mean()
         

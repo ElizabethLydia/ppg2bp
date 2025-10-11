@@ -11,23 +11,11 @@ import sys
 import os
 import logging
 import warnings
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Configure logging
-from datetime import datetime
-import matplotlib.pyplot as plt
-import csv
-
-# Centralized logging under config.LOG_DIR
-try:
-    os.makedirs(getattr(__import__('config'), 'LOG_DIR', './'), exist_ok=True)
-    log_path = os.path.join(getattr(__import__('config'), 'LOG_DIR', './'), f'processing_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
-except Exception:
-    log_path = 'processing.log'
-
-logging.basicConfig(level=logging.DEBUG,
+logging.basicConfig(level=logging.DEBUG, 
                    format='%(asctime)s - %(levelname)s - %(message)s',
-                   filename=log_path,
+                   filename='processing.log',
                    filemode='w')
 
 # Suppress pandas warnings
@@ -36,120 +24,6 @@ warnings.filterwarnings('ignore', category=RuntimeWarning)
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
-def create_subject_best_worst_overview(self, subject: str, subject_results: dict, subject_signals: dict):
-    """为单个受试者绘制总图：每个传感器挑选一个“最好窗口”和“最差窗口”。
-    质量依据：
-      - 优先使用 PT 误差（|峰值HR-真实HR|，越小越好）
-      - 若该窗口缺少真实HR则回退用 SNR（越大越好）
-      - 若窗口 is_valid=True，给微弱加分（不改变主排序只做tie-break）
-    在图上标注：SNR(dB) 与 PTerr(bpm)；若无真实HR则显示 N/A。
-    """
-    import math
-    rows = len(self.sensors)
-    cols = 2  # best, worst
-    fig, axes = plt.subplots(rows, cols, figsize=(cols*8, rows*3), squeeze=False, sharex=False)
-    fig.suptitle(f'{subject} - Best/Worst Quality Windows per Sensor', fontsize=16, fontweight='bold')
-
-    for r, sensor in enumerate(self.sensors):
-        # 收集 (exp_id, window_dict, fs, signal)
-        candidates = []
-        for exp_id, pack in subject_results.items():
-            win_list = pack.get('sensor_window_results', {}).get(sensor, [])
-            sig_pack = subject_signals.get(exp_id, {}).get(sensor, None)
-            if sig_pack is None:
-                continue
-            fs = int(sig_pack.get('fs', self.default_fs))
-            sig = sig_pack.get('signal', None)
-            if sig is None:
-                continue
-            for w in win_list:
-                candidates.append((exp_id, w, fs, sig))
-
-        if not candidates:
-            for c in range(cols):
-                axes[r, c].text(0.5, 0.5, f'{self.sensor_mapping.get(sensor, sensor)}: No Windows',
-                                ha='center', va='center', transform=axes[r, c].transAxes)
-                axes[r, c].set_axis_off()
-            continue
-
-        # 质量评分：优先PT误差（越小越好，用负号变成“越大越好”），缺失则用SNR
-        def quality_score(item):
-            exp_id, w, fs, sig = item
-            true_hr = w.get('true_hr_bpm', np.nan)
-            peak_hr = float(w.get('peak_hr_bpm', np.nan))
-            snr = float(w.get('snr_db', -1e9))
-            if isinstance(true_hr, float) and np.isfinite(true_hr):
-                score = -abs(peak_hr - true_hr)  # 误差越小越好
-            else:
-                score = snr  # 缺真实HR时，用SNR
-            # 有效窗口轻微加分（打破并列用）
-            if w.get('is_valid', False):
-                score += 0.1
-            return score
-
-        best_item = max(candidates, key=quality_score)
-        worst_item = min(candidates, key=quality_score)
-
-        for c, (title, item) in enumerate([(f'{self.sensor_mapping.get(sensor, sensor)} - BEST', best_item),
-                                           (f'{self.sensor_mapping.get(sensor, sensor)} - WORST', worst_item)]):
-            exp_id, w, fs, sig = item
-            start, end = int(w['start_sample']), int(w['end_sample'])
-            seg = np.asarray(sig[start:end], dtype=float)
-            t = np.arange(len(seg)) / fs
-            filt = self.bandpass_filter(seg, fs=fs)
-
-            ax = axes[r, c]
-            ax.plot(t, filt, color='tab:blue' if c == 0 else 'tab:red', linewidth=1.0)
-
-            # 标记峰值（映射到窗口坐标）
-            try:
-                gp = w.get('global_peak_indices', np.array([], dtype=int))
-                local_peaks = gp - start
-                local_peaks = local_peaks[(local_peaks >= 0) & (local_peaks < len(filt))]
-                if len(local_peaks) > 0:
-                    ax.scatter(local_peaks / fs, filt[local_peaks], s=14, c='orange', zorder=5, label='Peaks')
-            except Exception:
-                pass
-
-            # 准备注释：SNR 和 PT 误差
-            true_hr = w.get('true_hr_bpm', np.nan)
-            peak_hr = float(w.get('peak_hr_bpm', np.nan))
-            fft_hr = float(w.get('fft_hr_bpm', np.nan))
-            snr_db = float(w.get('snr_db', np.nan))
-            pt_err = abs(peak_hr - true_hr) if (isinstance(true_hr, float) and np.isfinite(true_hr)) else np.nan
-
-            meta = {
-                'exp': exp_id,
-                'valid': w.get('is_valid', False),
-                'HRp': peak_hr,
-                'HRf': fft_hr,
-                'PTerr': pt_err,
-                'SNR(dB)': snr_db,
-            }
-            subtitle = ", ".join([
-                f"{k}={v:.2f}" if isinstance(v, float) and np.isfinite(v) else f"{k}={v}"
-                for k, v in meta.items()
-            ])
-            ax.set_title(f"{title} | {subtitle}", fontsize=10)
-
-            # 右下角文字框：只强调 SNR 和 PTerr
-            box_lines = []
-            box_lines.append(f"SNR: {snr_db:.2f} dB" if np.isfinite(snr_db) else "SNR: N/A")
-            box_lines.append(f"PT err: {pt_err:.2f} bpm" if np.isfinite(pt_err) else "PT err: N/A")
-            ax.text(0.98, 0.02, "\n".join(box_lines), transform=ax.transAxes,
-                    ha='right', va='bottom', fontsize=9, color='black',
-                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.7, edgecolor='gray'))
-
-            ax.set_xlabel('Time (s)')
-            ax.set_ylabel('Filtered IR')
-            ax.grid(True, alpha=0.3)
-
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    out_path = os.path.join(self.output_dir, f"{subject}_best_worst_windows.png")
-    plt.savefig(out_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"📊 保存受试者总览图: {out_path}")
-    
 def decompress_archives(source_dir):
     logging.debug(f"Scanning for archives in: {source_dir}")
     archives = glob.glob(os.path.join(source_dir, "*.tar")) + glob.glob(os.path.join(source_dir, "*.tar.gz"))
@@ -360,35 +234,6 @@ def load_heart_rate(subject_folder, segment):
         
     except Exception as e:
         logging.debug(f"Error loading HR data: {e}")
-        return None
-
-def load_hr_series(subject_folder, segment):
-    """
-    加载每个分段的 HR 时间序列，返回 DataFrame(columns=[timestamp, hr, rel_time_s])。
-    rel_time_s = timestamp - timestamp.iloc[0]
-    如果文件缺失或无效，返回 None。
-    """
-    hr_path = os.path.join(subject_folder, f'{segment}_hr.csv')
-    if not os.path.exists(hr_path):
-        logging.debug(f"HR series file not found: {hr_path}")
-        return None
-    try:
-        df_hr = pd.read_csv(hr_path, header=None, dtype=str)
-        if df_hr.shape[1] < 2:
-            logging.debug(f"Invalid HR file format: {hr_path}")
-            return None
-        df_hr.columns = ['timestamp', 'hr']
-        df_hr['timestamp'] = pd.to_numeric(df_hr['timestamp'], errors='coerce')
-        df_hr['hr'] = pd.to_numeric(df_hr['hr'], errors='coerce')
-        df_hr.dropna(inplace=True)
-        if df_hr.empty:
-            return None
-        df_hr = df_hr.sort_values('timestamp').reset_index(drop=True)
-        t0 = df_hr['timestamp'].iloc[0]
-        df_hr['rel_time_s'] = df_hr['timestamp'] - t0
-        return df_hr
-    except Exception as e:
-        logging.debug(f"Error loading HR series: {e}")
         return None
 
 def load_omron_data():
@@ -847,10 +692,10 @@ def create_slices_from_valleys(ppg_data, bp_data, sensor_mask, subject_folder, s
         segment: Segment name (for loading HR)
     
     Returns:
-        ppg_slices, bp_slices, mask_slices, window_start_indices: 列表，window_start_indices 为每个窗口在重采样轨上的起始样本索引
+        ppg_slices, bp_slices, mask_slices: 切片列表
     """
     if ppg_data.shape[1] < config.WINDOW_SIZE:
-        return [], [], [], []
+        return [], [], []
     
     # Load heart rate if available
     avg_hr = load_heart_rate(subject_folder, segment)
@@ -860,13 +705,9 @@ def create_slices_from_valleys(ppg_data, bp_data, sensor_mask, subject_folder, s
     
     if len(valley_indices) < 2:
         logging.debug("Warning: Insufficient BP valleys found, using original slicing method")
-        ppg_slices, bp_slices, mask_slices = create_slices(ppg_data, bp_data, sensor_mask)
-        # 退化路径没有精确的起始索引，这里使用等间隔步长近似（以 STRIDE_SIZE 为步长）
-        window_start_indices = [i for i in range(0, bp_data.shape[0] - config.WINDOW_SIZE + 1, config.STRIDE_SIZE)] if ppg_slices else []
-        return ppg_slices, bp_slices, mask_slices, window_start_indices
+        return create_slices(ppg_data, bp_data, sensor_mask)
     
     ppg_slices, bp_slices, mask_slices = [], [], []
-    window_start_indices = []
     
     # 从每个波谷开始创建10秒窗口
     for valley_idx in valley_indices:
@@ -883,46 +724,9 @@ def create_slices_from_valleys(ppg_data, bp_data, sensor_mask, subject_folder, s
             ppg_slices.append(ppg_slice)
             bp_slices.append(bp_slice)
             mask_slices.append(sensor_mask)
-            window_start_indices.append(valley_idx)
     
     logging.debug(f"Created {len(ppg_slices)} valley-based slices from {len(valley_indices)} valleys")
-    return ppg_slices, bp_slices, mask_slices, window_start_indices
-
-def _compute_snr_per_channel(ppg_slice: np.ndarray, fs: int):
-    """Compute per-channel SNR within [SNR_BAND_LOW, SNR_BAND_HIGH] using a simple spectral method.
-    Steps: Welch/rFFT power; find f0 in HR range; signal band = [f0-δ, f0+δ]; noise band = band - signal; SNR = 10*log10(Psig / Pnoise_mean).
-    Returns: np.ndarray shape (C,) with SNR in dB (float), NaN if cannot compute.
-    """
-    try:
-        C, L = ppg_slice.shape
-    except Exception:
-        return None
-    snrs = np.full((C,), np.nan, dtype=np.float32)
-    # frequency grid
-    freqs = np.fft.rfftfreq(L, d=1.0/fs)
-    band_mask = (freqs >= getattr(config, 'SNR_BAND_LOW', 0.5)) & (freqs <= getattr(config, 'SNR_BAND_HIGH', 3.0))
-    hr_low, hr_high = getattr(config, 'SNR_HR_RANGE', (0.7, 2.5))
-    peak_nb = getattr(config, 'SNR_PEAK_NEIGHBOR', 0.12)
-    eps = 1e-12
-    for c in range(C):
-        x = ppg_slice[c] - np.mean(ppg_slice[c])
-        X = np.fft.rfft(x)
-        P = (np.abs(X) ** 2)
-        if not np.any(band_mask):
-            continue
-        # restrict to HR search range to find f0
-        hr_mask = (freqs >= hr_low) & (freqs <= hr_high)
-        if not np.any(hr_mask):
-            continue
-        hr_idx = np.argmax(P * hr_mask)
-        f0 = freqs[hr_idx]
-        sig_mask = (freqs >= max(getattr(config, 'SNR_BAND_LOW', 0.5), f0 - peak_nb)) & (freqs <= min(getattr(config, 'SNR_BAND_HIGH', 3.0), f0 + peak_nb))
-        noise_mask = band_mask & (~sig_mask)
-        Ps = np.sum(P[sig_mask])
-        Pn = np.mean(P[noise_mask]) if np.any(noise_mask) else eps
-        snr = 10.0 * np.log10((Ps + eps) / (Pn + eps))
-        snrs[c] = np.float32(snr)
-    return snrs
+    return ppg_slices, bp_slices, mask_slices
 
 def create_slices(ppg_data, bp_data, sensor_mask):
     """原始的切片方法（保持向后兼容）"""
@@ -942,714 +746,6 @@ def create_slices(ppg_data, bp_data, sensor_mask):
     
     return ppg_slices, bp_slices, mask_slices
 
-def _estimate_hr_peak_and_peaks(x: np.ndarray, fs: int):
-    """Estimate HR from peaks using scipy.find_peaks on a bandpassed-like signal x.
-    Returns (hr_bpm, peak_indices, peak_count)."""
-    try:
-        if len(x) < max(8, int(0.5 * fs)):
-            return 0.0, np.array([], dtype=int), 0
-        # simple robust thresholds
-        min_dist = int(0.3 * fs)
-        sig = x - np.mean(x)
-        std = np.std(sig) + 1e-6
-        mean = np.mean(sig)
-        candidates = [
-            (mean + 0.2 * std, 0.1 * std),
-            (mean + 0.1 * std, 0.05 * std),
-            (mean, 0.02 * std),
-        ]
-        peaks = np.array([], dtype=int)
-        for h, prom in candidates:
-            peaks, _ = signal.find_peaks(sig, height=h, distance=min_dist, prominence=prom)
-            if len(peaks) >= 3:
-                break
-        if len(peaks) < 2:
-            return 0.0, peaks, len(peaks)
-        peak_times = peaks / fs
-        ibi_ms = np.diff(peak_times) * 1000.0
-        valid = ibi_ms[(ibi_ms >= 300) & (ibi_ms <= 1200)]
-        if len(valid) > 0:
-            hr_bpm = float(np.mean(60000.0 / valid))
-        else:
-            hr_bpm = 0.0
-        return hr_bpm, peaks, len(peaks)
-    except Exception:
-        return 0.0, np.array([], dtype=int), 0
-
-def _estimate_hr_fft(x: np.ndarray, fs: int, min_bpm: int, max_bpm: int):
-    """Estimate HR from FFT peak in [min_bpm, max_bpm] range."""
-    try:
-        if len(x) < max(8, int(0.5 * fs)):
-            return 0.0
-        sig = x - np.mean(x)
-        P = np.abs(np.fft.rfft(sig)) ** 2
-        freqs = np.fft.rfftfreq(len(sig), d=1.0/fs)
-        mask = (freqs > (min_bpm/60.0)) & (freqs < (max_bpm/60.0))
-        if not np.any(mask):
-            return 0.0
-        idx = np.argmax(P * mask)
-        f0 = freqs[idx]
-        return float(f0 * 60.0)
-    except Exception:
-        return 0.0
-
-def _render_subject_overview(best_worst: dict, subject_id: str, split_name: str):
-    """Render a per-subject overview figure with best and worst window per sensor.
-    best_worst: dict[sensor_idx] -> {'best': cand, 'worst': cand}
-    cand contains: signal (1D np.array), fs, peaks (idx array), hr_peak, hr_fft, hr_diff, hr_valid, snr_db, spr, window_sqi, sensor_name, segment
-    """
-    try:
-        num_sensors = len(best_worst)
-        if num_sensors == 0:
-            return
-        cols = 2
-        rows = num_sensors
-        fig, axes = plt.subplots(rows, cols, figsize=(cols*6, max(2*rows, 4)))
-        if rows == 1:
-            axes = np.array([axes])
-        for i in range(num_sensors):
-            row_axes = axes[i]
-            # Best
-            ax = row_axes[0]
-            cand = best_worst[i].get('best', None)
-            ax.set_title('')
-            if cand is not None and isinstance(cand.get('signal', None), np.ndarray) and len(cand['signal']) > 0:
-                sig = cand['signal']
-                fs = cand.get('fs', 30)
-                t = np.arange(len(sig)) / max(fs, 1)
-                sig_plot = (sig - np.mean(sig)) / (np.std(sig) + 1e-6)
-                ax.plot(t, sig_plot, color='#1f77b4', lw=1.0)
-                peaks = cand.get('peaks', np.array([], dtype=int))
-                if peaks is not None and len(peaks) > 0:
-                    ax.scatter(peaks / max(fs, 1), sig_plot[peaks], c='#d62728', s=12, label='peaks')
-                title = f"BEST - {cand.get('sensor_name','sensor')} ({cand.get('segment','')})\n"
-                title += f"SNR {cand.get('snr_db', np.nan):.1f} dB, SQI {cand.get('window_sqi', np.nan):.3f}, HRp {cand.get('hr_peak',0):.0f}/HRf {cand.get('hr_fft',0):.0f}, d {cand.get('hr_diff', np.nan):.1f} bpm"
-                ax.set_title(title, fontsize=9)
-                ax.set_xlabel('Time (s)')
-                ax.set_ylabel(cand.get('sensor_name','sensor'))
-                ax.grid(True, alpha=0.3)
-            else:
-                ax.text(0.5, 0.5, 'No BEST window', ha='center', va='center')
-                ax.axis('off')
-            # Worst
-            ax = row_axes[1]
-            cand = best_worst[i].get('worst', None)
-            ax.set_title('')
-            if cand is not None and isinstance(cand.get('signal', None), np.ndarray) and len(cand['signal']) > 0:
-                sig = cand['signal']
-                fs = cand.get('fs', 30)
-                t = np.arange(len(sig)) / max(fs, 1)
-                sig_plot = (sig - np.mean(sig)) / (np.std(sig) + 1e-6)
-                ax.plot(t, sig_plot, color='#9467bd', lw=1.0)
-                peaks = cand.get('peaks', np.array([], dtype=int))
-                if peaks is not None and len(peaks) > 0:
-                    ax.scatter(peaks / max(fs, 1), sig_plot[peaks], c='#ff7f0e', s=12, label='peaks')
-                title = f"WORST - {cand.get('sensor_name','sensor')} ({cand.get('segment','')})\n"
-                title += f"SNR {cand.get('snr_db', np.nan):.1f} dB, SQI {cand.get('window_sqi', np.nan):.3f}, HRp {cand.get('hr_peak',0):.0f}/HRf {cand.get('hr_fft',0):.0f}, d {cand.get('hr_diff', np.nan):.1f} bpm"
-                ax.set_title(title, fontsize=9)
-                ax.set_xlabel('Time (s)')
-                ax.set_ylabel(cand.get('sensor_name','sensor'))
-                ax.grid(True, alpha=0.3)
-            else:
-                ax.text(0.5, 0.5, 'No WORST window', ha='center', va='center')
-                ax.axis('off')
-        plt.suptitle(f"Subject {subject_id} - {split_name} overview (Best vs Worst per Sensor)", fontsize=12)
-        plt.tight_layout(rect=[0, 0.03, 1, 0.96])
-        out_dir = getattr(config, 'SUBJECT_OVERVIEW_DIR', './')
-        os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, f"{subject_id}_{split_name}_overview.png")
-        plt.savefig(out_path, dpi=200)
-        plt.close(fig)
-    except Exception as e:
-        logging.debug(f"Failed to render subject overview for {subject_id}: {e}")
-
-
-def _quality_score(cand: dict, strategy: str = None):
-    """返回一个越大越好的分数；若缺少必要字段，返回-Inf。
-    支持的策略：
-    - 'pt'：-abs(hr_peak-true)
-    - 'ft'：-abs(hr_fft-true)
-    - 'min_true'：-min(abs(hr_peak-true), abs(hr_fft-true))（两者取更好者）
-    - 'snr'：snr_db
-    - 'pf_then_snr'：先用pf有效(1/0)+snr归一化
-    - 'pt_then_snr'（默认）：若存在trueHR，用 -abs(hr_peak-true)；否则用 snr
-    - 'composite'：0.6*snr - 0.4*hr_diff_peak_fft（越小越好）
-    """
-    if strategy is None:
-        strategy = getattr(config, 'QUALITY_STRATEGY', 'pt_then_snr')
-    snr = cand.get('snr_db', np.nan)
-    hrp = cand.get('hr_peak', np.nan)
-    hrf = cand.get('hr_fft', np.nan)
-    tru = cand.get('true_hr', np.nan)
-    pf = bool(cand.get('hr_valid', False))
-    diff_pf = cand.get('hr_diff', np.nan)
-    if strategy == 'pt':
-        if np.isfinite(tru) and np.isfinite(hrp) and hrp > 0:
-            return -abs(hrp - tru)
-        return -np.inf
-    if strategy == 'ft':
-        if np.isfinite(tru) and np.isfinite(hrf) and hrf > 0:
-            return -abs(hrf - tru)
-        return -np.inf
-    if strategy == 'min_true':
-        vals = []
-        if np.isfinite(tru) and np.isfinite(hrp) and hrp > 0:
-            vals.append(abs(hrp - tru))
-        if np.isfinite(tru) and np.isfinite(hrf) and hrf > 0:
-            vals.append(abs(hrf - tru))
-        return -min(vals) if vals else -np.inf
-    if strategy == 'snr':
-        return float(snr) if np.isfinite(snr) else -np.inf
-    if strategy == 'pf_then_snr':
-        base = 1.0 if pf else 0.0
-        snr_v = float(snr) if np.isfinite(snr) else -100.0
-        return base * 1000.0 + snr_v
-    if strategy == 'pt_then_snr':
-        if np.isfinite(tru) and np.isfinite(hrp) and hrp > 0:
-            return -abs(hrp - tru)
-        return float(snr) if np.isfinite(snr) else -np.inf
-    if strategy == 'composite':
-        snr_v = float(snr) if np.isfinite(snr) else -50.0
-        diff_v = float(diff_pf) if np.isfinite(diff_pf) else 20.0
-        return 0.6*snr_v - 0.4*diff_v
-    # fallback
-    return float(snr) if np.isfinite(snr) else -np.inf
-
-
-def _update_best_worst(best_worst: dict, sensor_idx: int, cand: dict, strategy: str = None):
-    """根据评分策略更新每个传感器的最佳/最差候选。"""
-    try:
-        score = _quality_score(cand, strategy)
-        if not np.isfinite(score):
-            return
-        entry = best_worst.get(sensor_idx)
-        if entry is None:
-            best_worst[sensor_idx] = {'best': None, 'worst': None}
-            entry = best_worst[sensor_idx]
-        if entry['best'] is None or score > _quality_score(entry['best'], strategy):
-            entry['best'] = cand
-        if entry['worst'] is None or score < _quality_score(entry['worst'], strategy):
-            entry['worst'] = cand
-    except Exception:
-        pass
-
-
-def _select_best_worst(candidates: list, strategy: str = 'snr'):
-    """选择最佳与最差窗口：
-    - 最佳（best）：从合规层级最高的集合中选择（优先 strict>pf∧pt>pf>任意），按 strategy（默认SNR）最大。
-    - 最差（worst）：从合规层级最低的集合中选择（优先 不达标<pf<pf∧pt<strict），按 strategy 最小。
-    这样 worst 优先展示真正“不达标”的最差样本，而不是“合规集合中的最差”。
-    """
-    if not candidates:
-        return {'best': None, 'worst': None}
-
-    def level(c):
-        strict_ok = bool(c.get('peaks_gt5', False)) and (not bool(c.get('is_flat', False))) and bool(c.get('pf_valid', False)) and bool(c.get('pt_valid', False))
-        pf_pt_ok = bool(c.get('pf_valid', False)) and bool(c.get('pt_valid', False))
-        pf_ok = bool(c.get('pf_valid', False))
-        if strict_ok:
-            return 3
-        if pf_pt_ok:
-            return 2
-        if pf_ok:
-            return 1
-        return 0  # 不达标
-
-    def score(c):
-        if strategy == 'snr':
-            v = c.get('snr_db', np.nan)
-            return float(v) if np.isfinite(v) else -np.inf
-        return _quality_score(c, strategy=strategy)
-
-    # 计算每层集合
-    by_level = {0: [], 1: [], 2: [], 3: []}
-    for c in candidates:
-        by_level[level(c)].append(c)
-
-    # best 从最高非空层取分数最大
-    best = None
-    for lv in (3, 2, 1, 0):
-        if by_level[lv]:
-            best = max(by_level[lv], key=score)
-            break
-
-    # worst 从最低非空层取分数最小；若是非达标层（lv=0）且有平坦窗口，则优先在平坦中选 SNR 最低
-    worst = None
-    for lv in (0, 1, 2, 3):
-        if by_level[lv]:
-            if lv == 0:
-                flats = [c for c in by_level[lv] if bool(c.get('is_flat', False))]
-                if flats:
-                    # 平坦优先，平坦中选 SNR 最低
-                    def snr_value(c):
-                        v = c.get('snr_db', np.nan)
-                        return float(v) if np.isfinite(v) else np.inf
-                    worst = min(flats, key=snr_value)
-                else:
-                    worst = min(by_level[lv], key=score)
-            else:
-                worst = min(by_level[lv], key=score)
-            break
-
-    return {'best': best, 'worst': worst}
-
-
-def _process_one_subject(subject_id: str, split_name: str, moved_data_dir: str):
-    """工作进程：处理一个受试者（两个segment），返回可聚合的数据与通过统计行。
-    返回 dict: {
-      'ppg': list[np.ndarray], 'bp': list[np.ndarray], 'mask': list[np.ndarray],
-      'seg1_ppg': list, 'seg1_bp': list, 'seg1_mask': list,
-      'seg7_ppg': list, 'seg7_bp': list, 'seg7_mask': list,
-      'pass_rows': list[dict],
-      'error': Optional[str]
-    }
-    同时函数内部负责写每人相关的CSV/PNG到唯一文件名，避免并发冲突。
-    """
-    try:
-        subject_folder = os.path.join(config.RAW_DATA_DIR, subject_id)
-        if not os.path.isdir(subject_folder):
-            return {'error': f"subject folder missing: {subject_id}", 'subject_id': subject_id}
-
-        # 每受试者共享的BP校准偏移
-        shift_amount = calculate_bp_shift_amount(subject_id)
-
-        # 聚合器
-        all_ppg_for_subject, all_bp_for_subject, all_masks_for_subject = [], [], []
-        seg1_ppg, seg1_bp, seg1_masks = [], [], []
-        seg7_ppg, seg7_bp, seg7_masks = [], [], []
-        pass_rows = []
-
-        # 最佳/最差大图候选
-        best_worst = {i: {'best': None, 'worst': None} for i in range(len(config.SENSORS_TO_USE))}
-        strategy = getattr(config, 'QUALITY_STRATEGY', 'pt_then_snr')
-
-        for segment in ['seg1', 'seg7']:
-            result = process_segment_data(subject_folder, segment, moved_data_dir, shift_amount)
-            if result is None:
-                continue
-            ppg_data, bp_data, sensor_mask = result
-            ppg_slices, bp_slices, mask_slices, window_start_indices = create_slices_from_valleys(
-                ppg_data, bp_data, sensor_mask, subject_folder, segment
-            )
-            df_hr_series = load_hr_series(subject_folder, segment)
-
-            if not ppg_slices:
-                continue
-
-            # 添加到subject聚合器
-            all_ppg_for_subject.extend(ppg_slices)
-            all_bp_for_subject.extend(bp_slices)
-            all_masks_for_subject.extend(mask_slices)
-            if segment == 'seg1':
-                seg1_ppg.extend(ppg_slices)
-                seg1_bp.extend(bp_slices)
-                seg1_masks.extend(mask_slices)
-            else:
-                seg7_ppg.extend(ppg_slices)
-                seg7_bp.extend(bp_slices)
-                seg7_masks.extend(mask_slices)
-
-            # 计算窗口级统计、可视化和最佳/最差候选
-            window_hr_valid = []
-            window_all_valid = []
-            sensor_signals = {}
-            window_peaks = {s: {} for s in config.SENSORS_TO_USE}
-            per_sensor_stats = {s: {'peak': [], 'fft': [], 'diff': []} for s in config.SENSORS_TO_USE}
-            per_sensor_flags = {s: {
-                'pf_valid_vec': [],
-                'pt_valid_vec': [], 'pt_avail_vec': [],
-                'ft_valid_vec': [], 'ft_avail_vec': [],
-                'triple_valid_vec': [], 'triple_avail_vec': [],
-                'pf_and_pt_vec': [],
-                'strict_vec': [],  # peaks>5 & not flat & pf & pt
-            } for s in config.SENSORS_TO_USE}
-            fs = config.TARGET_SAMPLING_RATE
-            window_size = config.WINDOW_SIZE
-            stride = config.STRIDE_SIZE
-            tol_bpm = getattr(config, 'HR_TOLERANCE_BPM', 5)
-
-            per_window_rows = []
-            # 为该段收集每通道候选后统一筛选（而不是逐行即刻更新），可更好满足严格条件
-            segment_candidates = {i: [] for i in range(len(config.SENSORS_TO_USE))}
-
-            for w, ppg_slice in enumerate(ppg_slices):
-                C, L = ppg_slice.shape
-                valid_flags = []
-                # 窗口真实HR
-                true_hr_window = np.nan
-                if df_hr_series is not None:
-                    start_idx = window_start_indices[w]
-                    end_idx = start_idx + window_size
-                    start_time = start_idx / fs
-                    end_time = end_idx / fs
-                    hr_in_win = df_hr_series[(df_hr_series['rel_time_s'] >= start_time) & (df_hr_series['rel_time_s'] < end_time)]['hr']
-                    if not hr_in_win.empty:
-                        true_hr_window = float(hr_in_win.mean())
-
-                # SNR per channel
-                try:
-                    snr_vals = _compute_snr_per_channel(ppg_slice, fs=config.TARGET_SAMPLING_RATE)
-                except Exception:
-                    snr_vals = None
-
-                for c in range(C):
-                    x = ppg_slice[c]
-                    hr_peak_bpm, peak_idx_list, peak_count = _estimate_hr_peak_and_peaks(x, fs)
-                    hr_fft_bpm = _estimate_hr_fft(x, fs, getattr(config, 'HR_MIN_BPM', 50), getattr(config, 'HR_MAX_BPM', 200))
-                    hr_diff = float(abs(hr_peak_bpm - hr_fft_bpm)) if (hr_peak_bpm > 0 and hr_fft_bpm > 0) else float('inf')
-                    hr_valid = (hr_peak_bpm > 0 and hr_fft_bpm > 0 and hr_diff <= tol_bpm and peak_count >= getattr(config, 'PEAK_MIN_COUNT', 3))
-                    valid_flags.append(hr_valid)
-
-                    sensor = config.SENSORS_TO_USE[c]
-                    window_peaks[sensor][w] = list(peak_idx_list)
-
-                    if hr_peak_bpm > 0 and hr_fft_bpm > 0 and np.isfinite(hr_diff):
-                        per_sensor_stats[sensor]['peak'].append(float(hr_peak_bpm))
-                        per_sensor_stats[sensor]['fft'].append(float(hr_fft_bpm))
-                        per_sensor_stats[sensor]['diff'].append(float(hr_diff))
-
-                    snr_c = float(snr_vals[c]) if (snr_vals is not None and np.isfinite(snr_vals[c])) else np.nan
-                    freqs = np.fft.rfftfreq(L, d=1.0/fs)
-                    X = np.fft.rfft(x - np.mean(x))
-                    P = np.abs(X) ** 2
-                    band_mask = (freqs >= config.PPG_FILTER_LOW) & (freqs <= config.PPG_FILTER_HIGH)
-                    band_power = float(P[band_mask].sum()) if np.any(band_mask) else np.nan
-                    total_power = float(P.sum())
-                    spr = float(np.clip(band_power / (total_power + 1e-8), 0, 1)) if np.isfinite(band_power) else np.nan
-                    # 平坦检测：使用导数阈值占比 + 幅度范围
-                    dx = np.diff(x)
-                    flat_ratio = float(np.mean(np.abs(dx) < 1e-3))
-                    amp_range = float(np.percentile(x, 95) - np.percentile(x, 5))
-                    flat_thresh = getattr(config, 'FLAT_DX_RATIO_THRESH', 0.6)  # 超过该比例认为较平
-                    amp_thresh = getattr(config, 'FLAT_AMP_MIN', 0.02)        # 幅度过小认为平
-                    is_flat = (flat_ratio >= flat_thresh) or (amp_range <= amp_thresh)
-                    peaks_gt5 = (peak_count > getattr(config, 'PEAK_MIN_FOR_BEST', 5))
-
-                    # 一致性标记（在写行之前先算好）
-                    pf_valid = bool(hr_valid)
-                    pt_avail = (np.isfinite(true_hr_window) and hr_peak_bpm > 0)
-                    pt_valid = (pt_avail and abs(hr_peak_bpm - true_hr_window) <= tol_bpm)
-                    ft_avail = (np.isfinite(true_hr_window) and hr_fft_bpm > 0)
-                    ft_valid = (ft_avail and abs(hr_fft_bpm - true_hr_window) <= tol_bpm)
-                    triple_avail = (pt_avail and ft_avail and hr_peak_bpm > 0 and hr_fft_bpm > 0)
-                    triple_valid = (triple_avail and pf_valid and pt_valid and ft_valid)
-                    pf_and_pt = bool(pf_valid and pt_valid)
-                    strict_ok = bool(peaks_gt5 and (not is_flat) and pf_valid and pt_valid)
-
-                    start_idx = window_start_indices[w]
-                    end_idx = start_idx + window_size
-                    per_window_rows.append({
-                        'split': split_name,
-                        'subject_id': subject_id,
-                        'segment': segment,
-                        'window_idx': w,
-                        'window_start_idx': int(start_idx),
-                        'window_end_idx': int(end_idx),
-                        'window_start_time_s': round(start_idx / fs, 6),
-                        'window_end_time_s': round(end_idx / fs, 6),
-                        'sensor_idx': int(c),
-                        'sensor_name': sensor,
-                        'peak_hr_bpm': float(hr_peak_bpm),
-                        'fft_hr_bpm': float(hr_fft_bpm),
-                        'hr_diff_bpm': float(hr_diff) if np.isfinite(hr_diff) else np.nan,
-                        'peak_count': int(peak_count),
-                        'snr_db': snr_c,
-                        'spr': spr,
-                        'band_power': band_power,
-                        'total_power': total_power,
-                        'hr_valid': bool(hr_valid),
-                        'all_channels_valid': None,
-                        'true_hr_bpm': float(true_hr_window) if np.isfinite(true_hr_window) else np.nan,
-                        'peaks_gt5': bool(peaks_gt5),
-                        'is_flat': bool(is_flat),
-                        'pt_valid': bool(pt_valid),
-                        'pf_and_pt': bool(pf_and_pt),
-                        'strict': bool(strict_ok),
-                    })
-
-                    # 更新最佳/最差候选（使用原始或轻度滤波信号）
-                    try:
-                        x_f = butter_bandpass_filter(x, config.PPG_FILTER_LOW, config.PPG_FILTER_HIGH, fs, order=3)
-                    except Exception:
-                        x_f = x
-                    # 将一致性标记写入统计向量
-                    per_sensor_flags[sensor]['pf_valid_vec'].append(pf_valid)
-                    per_sensor_flags[sensor]['pt_avail_vec'].append(bool(pt_avail))
-                    per_sensor_flags[sensor]['pt_valid_vec'].append(bool(pt_valid))
-                    per_sensor_flags[sensor]['ft_avail_vec'].append(bool(ft_avail))
-                    per_sensor_flags[sensor]['ft_valid_vec'].append(bool(ft_valid))
-                    per_sensor_flags[sensor]['triple_avail_vec'].append(bool(triple_avail))
-                    per_sensor_flags[sensor]['triple_valid_vec'].append(bool(triple_valid))
-                    per_sensor_flags[sensor]['pf_and_pt_vec'].append(bool(pf_and_pt))
-                    per_sensor_flags[sensor]['strict_vec'].append(strict_ok)
-
-                    cand = {
-                        'signal': x_f.astype(float),
-                        'fs': fs,
-                        'peaks': peak_idx_list,
-                        'hr_peak': float(hr_peak_bpm),
-                        'hr_fft': float(hr_fft_bpm),
-                        'hr_diff': float(hr_diff) if np.isfinite(hr_diff) else np.nan,
-                        'hr_valid': bool(hr_valid),
-                        'snr_db': snr_c,
-                        'spr': spr,
-                        'window_sqi': np.nan,  # 暂无统一SQI，后续可扩展
-                        'sensor_idx': c,
-                        'sensor_name': sensor,
-                        'segment': segment,
-                        'subject_id': subject_id,
-                        'true_hr': float(true_hr_window) if np.isfinite(true_hr_window) else np.nan,
-                        'peaks_gt5': bool(peaks_gt5),
-                        'is_flat': bool(is_flat),
-                        'pf_valid': bool(pf_valid),
-                        'pt_valid': bool(pt_valid),
-                        'window_start_idx': int(start_idx),
-                        'window_end_idx': int(end_idx),
-                    }
-                    segment_candidates[c].append(cand)
-
-                    if w == 0:
-                        sensor_signals[sensor] = {'signal': ppg_data[c], 'fs': fs}
-
-                all_flag = bool(all(valid_flags))
-                start_row = len(per_window_rows) - C
-                if start_row >= 0:
-                    for i in range(C):
-                        per_window_rows[start_row + i]['all_channels_valid'] = all_flag
-                window_hr_valid.append(valid_flags)
-                window_all_valid.append(all_flag)
-
-            window_hr_valid = np.array(window_hr_valid)
-            window_all_valid = np.array(window_all_valid)
-
-            # 每段窗口通过统计行
-            row = {
-                'split': split_name,
-                'subject_id': subject_id,
-                'segment': segment,
-                'total_windows': int(window_hr_valid.shape[0]),
-                'all_channels_pass_windows': int(np.sum(window_all_valid)),
-                'all_channels_pass_ratio': float(np.mean(window_all_valid)) if len(window_all_valid) > 0 else 0.0,
-            }
-            for s_idx, sensor in enumerate(config.SENSORS_TO_USE):
-                row[f'{sensor}_pass_windows'] = int(np.sum(window_hr_valid[:, s_idx])) if window_hr_valid.size else 0
-                row[f'{sensor}_pass_ratio'] = float(np.mean(window_hr_valid[:, s_idx])) if window_hr_valid.size else 0.0
-            # 追加 ALL_SENSORS 的 pf_and_pt 与 strict 统计（窗口层）
-            try:
-                total_windows = int(window_hr_valid.shape[0])
-                def _all_ok(flag_key, avail_key=None):
-                    count = 0
-                    for w_idx in range(total_windows):
-                        ok = True
-                        for s in config.SENSORS_TO_USE:
-                            if avail_key is not None and not per_sensor_flags[s][avail_key][w_idx]:
-                                ok = False; break
-                            if not per_sensor_flags[s][flag_key][w_idx]:
-                                ok = False; break
-                        if ok:
-                            count += 1
-                    return count
-                pf_and_pt_all = _all_ok('pf_and_pt_vec') if total_windows > 0 else 0
-                strict_all = _all_ok('strict_vec') if total_windows > 0 else 0
-                row['pf_and_pt_all_sensors_windows'] = pf_and_pt_all
-                row['pf_and_pt_all_sensors_ratio'] = float(pf_and_pt_all / total_windows) if total_windows > 0 else 0.0
-                row['strict_all_sensors_windows'] = strict_all
-                row['strict_all_sensors_ratio'] = float(strict_all / total_windows) if total_windows > 0 else 0.0
-            except Exception:
-                pass
-            pass_rows.append(row)
-
-            # 在该分段结束后，根据候选统一选择最佳/最差（严格条件优先）并写入总览
-            try:
-                for c in range(len(config.SENSORS_TO_USE)):
-                    sel = _select_best_worst(segment_candidates.get(c, []), strategy='snr')
-                    if sel.get('best') is not None:
-                        _update_best_worst(best_worst, c, sel['best'], strategy='snr')
-                    if sel.get('worst') is not None:
-                        _update_best_worst(best_worst, c, sel['worst'], strategy='snr')
-            except Exception:
-                pass
-
-            # 可视化窗口矩阵
-            try:
-                _viz = globals().get('create_windowed_visualizations', None)
-                if callable(_viz):
-                    _viz(subject_id, f"{split_name}_{segment}", window_hr_valid, window_all_valid, sensor_signals, window_peaks, fs, window_size, stride, window_start_indices)
-            except Exception:
-                pass
-
-            # 保存每段物理特征
-            try:
-                if per_window_rows:
-                    out_dir = getattr(config, 'SUBJECT_OVERVIEW_DIR', './')
-                    os.makedirs(out_dir, exist_ok=True)
-                    cols = ['split','subject_id','segment','window_idx','window_start_idx','window_end_idx','window_start_time_s','window_end_time_s','sensor_idx','sensor_name','peak_hr_bpm','fft_hr_bpm','hr_diff_bpm','peak_count','snr_db','spr','band_power','total_power','hr_valid','all_channels_valid','true_hr_bpm','peaks_gt5','is_flat','pt_valid','pf_and_pt','strict']
-                    per_window_df = pd.DataFrame(per_window_rows, columns=cols)
-                    per_file = os.path.join(out_dir, f"physics_features_{subject_id}_{split_name}_{segment}.csv")
-                    tmp_file = per_file + '.tmp'
-                    per_window_df.to_csv(tmp_file, index=False)
-                    os.replace(tmp_file, per_file)
-            except Exception as e:
-                logging.debug(f"保存 per-window 物理特征失败({subject_id},{segment}): {e}")
-
-            # 保存统计表和矩阵
-            try:
-                out_dir = getattr(config, 'SUBJECT_OVERVIEW_DIR', './')
-                os.makedirs(out_dir, exist_ok=True)
-                total_windows = int(window_hr_valid.shape[0])
-
-                per_sensor_rows = []
-                for s_idx, sensor in enumerate(config.SENSORS_TO_USE):
-                    valid_windows = int(np.sum(window_hr_valid[:, s_idx])) if total_windows > 0 else 0
-                    ratio = float(valid_windows / total_windows) if total_windows > 0 else 0.0
-                    def _mean_safe(arr):
-                        return float(np.mean(arr)) if (arr is not None and len(arr) > 0) else np.nan
-                    avg_peak = _mean_safe(per_sensor_stats[sensor]['peak'])
-                    avg_fft = _mean_safe(per_sensor_stats[sensor]['fft'])
-                    avg_diff = _mean_safe(per_sensor_stats[sensor]['diff'])
-                    pf_valid_windows = int(np.sum(per_sensor_flags[sensor]['pf_valid_vec'])) if total_windows > 0 else 0
-                    pf_valid_ratio = float(pf_valid_windows / total_windows) if total_windows > 0 else 0.0
-                    pt_total = int(np.sum(per_sensor_flags[sensor]['pt_avail_vec']))
-                    pt_valid_windows = int(np.sum(per_sensor_flags[sensor]['pt_valid_vec']))
-                    pt_valid_ratio = float(pt_valid_windows / pt_total) if pt_total > 0 else np.nan
-                    ft_total = int(np.sum(per_sensor_flags[sensor]['ft_avail_vec']))
-                    ft_valid_windows = int(np.sum(per_sensor_flags[sensor]['ft_valid_vec']))
-                    ft_valid_ratio = float(ft_valid_windows / ft_total) if ft_total > 0 else np.nan
-                    triple_total = int(np.sum(per_sensor_flags[sensor]['triple_avail_vec']))
-                    triple_valid_windows = int(np.sum(per_sensor_flags[sensor]['triple_valid_vec']))
-                    triple_valid_ratio = float(triple_valid_windows / triple_total) if triple_total > 0 else np.nan
-                    # 扩展统计：pf_and_pt 与 strict
-                    pf_and_pt_windows = int(np.sum(per_sensor_flags[sensor]['pf_and_pt_vec'])) if total_windows > 0 else 0
-                    pf_and_pt_ratio = float(pf_and_pt_windows / total_windows) if total_windows > 0 else 0.0
-                    strict_windows = int(np.sum(per_sensor_flags[sensor]['strict_vec'])) if total_windows > 0 else 0
-                    strict_ratio = float(strict_windows / total_windows) if total_windows > 0 else 0.0
-
-                    per_sensor_rows.append({
-                        'split': split_name,
-                        'subject_id': subject_id,
-                        'segment': segment,
-                        'sensor': sensor,
-                        'total_windows': total_windows,
-                        'valid_windows': valid_windows,
-                        'valid_ratio': round(ratio, 6),
-                        'avg_peak_hr_bpm': round(avg_peak, 3) if np.isfinite(avg_peak) else np.nan,
-                        'avg_fft_hr_bpm': round(avg_fft, 3) if np.isfinite(avg_fft) else np.nan,
-                        'avg_hr_diff_bpm': round(avg_diff, 3) if np.isfinite(avg_diff) else np.nan,
-                        'pf_valid_windows': pf_valid_windows,
-                        'pf_valid_ratio': round(pf_valid_ratio, 6),
-                        'pf_and_pt_windows': pf_and_pt_windows,
-                        'pf_and_pt_ratio': round(pf_and_pt_ratio, 6),
-                        'pt_total_truehr_windows': pt_total,
-                        'pt_valid_windows': pt_valid_windows,
-                        'pt_valid_ratio': round(pt_valid_ratio, 6) if np.isfinite(pt_valid_ratio) else np.nan,
-                        'ft_total_truehr_windows': ft_total,
-                        'ft_valid_windows': ft_valid_windows,
-                        'ft_valid_ratio': round(ft_valid_ratio, 6) if np.isfinite(ft_valid_ratio) else np.nan,
-                        'triple_total_truehr_windows': triple_total,
-                        'triple_valid_windows': triple_valid_windows,
-                        'triple_valid_ratio': round(triple_valid_ratio, 6) if np.isfinite(triple_valid_ratio) else np.nan,
-                        'strict_windows': strict_windows,
-                        'strict_ratio': round(strict_ratio, 6),
-                    })
-
-                def _all_sensors_count(flag_key, avail_key=None):
-                    count = 0
-                    for w_idx in range(total_windows):
-                        ok = True
-                        for s in config.SENSORS_TO_USE:
-                            if avail_key is not None and not per_sensor_flags[s][avail_key][w_idx]:
-                                ok = False; break
-                            if not per_sensor_flags[s][flag_key][w_idx]:
-                                ok = False; break
-                        if ok:
-                            count += 1
-                    return count
-
-                all_valid_count = int(np.sum(window_all_valid)) if total_windows > 0 else 0
-                all_valid_ratio = float(all_valid_count / total_windows) if total_windows > 0 else 0.0
-                pt_all_count = _all_sensors_count('pt_valid_vec', 'pt_avail_vec') if total_windows > 0 else 0
-                ft_all_count = _all_sensors_count('ft_valid_vec', 'ft_avail_vec') if total_windows > 0 else 0
-                triple_all_count = _all_sensors_count('triple_valid_vec', 'triple_avail_vec') if total_windows > 0 else 0
-                pf_and_pt_all_count = _all_sensors_count('pf_and_pt_vec') if total_windows > 0 else 0
-                strict_all_count = _all_sensors_count('strict_vec') if total_windows > 0 else 0
-                pt_all_ratio = float(pt_all_count / total_windows) if total_windows > 0 else 0.0
-                ft_all_ratio = float(ft_all_count / total_windows) if total_windows > 0 else 0.0
-                triple_all_ratio = float(triple_all_count / total_windows) if total_windows > 0 else 0.0
-                pf_and_pt_all_ratio = float(pf_and_pt_all_count / total_windows) if total_windows > 0 else 0.0
-                strict_all_ratio = float(strict_all_count / total_windows) if total_windows > 0 else 0.0
-
-                per_sensor_rows.append({
-                    'split': split_name,
-                    'subject_id': subject_id,
-                    'segment': segment,
-                    'sensor': 'ALL_SENSORS',
-                    'total_windows': total_windows,
-                    'valid_windows': all_valid_count,
-                    'valid_ratio': round(all_valid_ratio, 6),
-                    'pf_valid_windows': all_valid_count,
-                    'pf_valid_ratio': round(all_valid_ratio, 6),
-                    'pf_and_pt_all_sensors_windows': pf_and_pt_all_count,
-                    'pf_and_pt_all_sensors_ratio': round(pf_and_pt_all_ratio, 6),
-                    'pt_all_sensors_windows': pt_all_count,
-                    'pt_all_sensors_ratio': round(pt_all_ratio, 6),
-                    'ft_all_sensors_windows': ft_all_count,
-                    'ft_all_sensors_ratio': round(ft_all_ratio, 6),
-                    'triple_all_sensors_windows': triple_all_count,
-                    'triple_all_sensors_ratio': round(triple_all_ratio, 6),
-                    'strict_all_sensors_windows': strict_all_count,
-                    'strict_all_sensors_ratio': round(strict_all_ratio, 6),
-                })
-
-                per_sensor_df = pd.DataFrame(per_sensor_rows)
-                stats_file = os.path.join(out_dir, f"window_stats_{subject_id}_{split_name}_{segment}.csv")
-                tmp_stats = stats_file + '.tmp'
-                per_sensor_df.to_csv(tmp_stats, index=False)
-                os.replace(tmp_stats, stats_file)
-
-                # 详情与矩阵
-                matrix_rows = []
-                for w_idx in range(total_windows):
-                    rowm = {
-                        'split': split_name,
-                        'subject_id': subject_id,
-                        'segment': segment,
-                        'window_idx': w_idx,
-                        'all_sensors_valid': bool(window_all_valid[w_idx]) if total_windows > 0 else False,
-                    }
-                    for s_idx, sensor in enumerate(config.SENSORS_TO_USE):
-                        rowm[f"valid_{sensor}"] = bool(window_hr_valid[w_idx, s_idx]) if total_windows > 0 else False
-                    matrix_rows.append(rowm)
-                matrix_df = pd.DataFrame(matrix_rows)
-                matrix_file = os.path.join(out_dir, f"window_hr_valid_matrix_{subject_id}_{split_name}_{segment}.csv")
-                tmp_mat = matrix_file + '.tmp'
-                matrix_df.to_csv(tmp_mat, index=False)
-                os.replace(tmp_mat, matrix_file)
-            except Exception as e:
-                logging.debug(f"保存窗口统计失败({subject_id},{segment}): {e}")
-
-        # 受试者处理完成后绘制最佳/最差总览（默认启用）
-        if getattr(config, 'SQI_SUBJECT_OVERVIEW', True):
-            try:
-                _render_subject_overview(best_worst, subject_id=subject_id, split_name=split_name)
-            except Exception:
-                pass
-
-        return {
-            'subject_id': subject_id,
-            'ppg': all_ppg_for_subject,
-            'bp': all_bp_for_subject,
-            'mask': all_masks_for_subject,
-            'seg1_ppg': seg1_ppg,
-            'seg1_bp': seg1_bp,
-            'seg1_mask': seg1_masks,
-            'seg7_ppg': seg7_ppg,
-            'seg7_bp': seg7_bp,
-            'seg7_mask': seg7_masks,
-            'pass_rows': pass_rows,
-        }
-    except Exception as e:
-        return {'error': str(e), 'subject_id': subject_id}
-
 def main():
     decompress_archives(config.SHARED_DATA_DIR)
     
@@ -1659,7 +755,7 @@ def main():
     os.makedirs(config.PROCESSED_DATA_DIR, exist_ok=True)
     
     # Create moved data directory for saving calibrated BP data
-    moved_data_dir = getattr(config, 'MOVED_DATA_DIR', os.path.join(os.path.dirname(config.PROCESSED_DATA_DIR), 'moved'))
+    moved_data_dir = os.path.join(os.path.dirname(config.PROCESSED_DATA_DIR), 'moved')
     os.makedirs(moved_data_dir, exist_ok=True)
     logging.debug(f"Created moved data directory: {moved_data_dir}")
     
@@ -1668,56 +764,57 @@ def main():
     for split_name, subjects in subject_splits.items():
         if not subjects:
             continue
-        
-        # --- 并行执行每个受试者 ---
-        logging.debug(f"Generating {split_name.upper()} SET")
+            
         all_ppg_for_split, all_bp_for_split, all_masks_for_split = [], [], []
+        # Add separate collections for seg1 and seg7
         seg1_ppg_for_split, seg1_bp_for_split, seg1_masks_for_split = [], [], []
         seg7_ppg_for_split, seg7_bp_for_split, seg7_masks_for_split = [], [], []
-        split_subject_pass_rows = []
+        
+        logging.debug(f"Generating {split_name.upper()} SET")
+        for subject_id in tqdm(subjects, desc=f"Processing {split_name} subjects"):
+            subject_folder = os.path.join(config.RAW_DATA_DIR, subject_id)
+            if not os.path.isdir(subject_folder):
+                logging.warning(f"Warning: Directory for subject {subject_id} not found.")
+                continue
 
-        max_workers = int(getattr(config, 'NUM_WORKERS', 8) or 8)
-        with ProcessPoolExecutor(max_workers=max_workers) as ex:
-            futures = {ex.submit(_process_one_subject, subject_id, split_name, moved_data_dir): subject_id for subject_id in subjects}
-            for fut in tqdm(as_completed(futures), total=len(futures), desc=f"Processing {split_name} subjects (parallel)"):
-                sid = futures[fut]
-                try:
-                    res = fut.result()
-                except Exception as e:
-                    logging.debug(f"Worker crashed for {sid}: {e}")
-                    continue
-                if res is None:
-                    continue
-                if res.get('error'):
-                    logging.debug(f"Subject {sid} error: {res['error']}")
-                    continue
-                # 聚合
-                all_ppg_for_split.extend(res.get('ppg', []))
-                all_bp_for_split.extend(res.get('bp', []))
-                all_masks_for_split.extend(res.get('mask', []))
-                seg1_ppg_for_split.extend(res.get('seg1_ppg', []))
-                seg1_bp_for_split.extend(res.get('seg1_bp', []))
-                seg1_masks_for_split.extend(res.get('seg1_mask', []))
-                seg7_ppg_for_split.extend(res.get('seg7_ppg', []))
-                seg7_bp_for_split.extend(res.get('seg7_bp', []))
-                seg7_masks_for_split.extend(res.get('seg7_mask', []))
-                split_subject_pass_rows.extend(res.get('pass_rows', []))
+            # Calculate shift amount once per subject based on seg1
+            shift_amount = calculate_bp_shift_amount(subject_id)
 
-        # 在当前 split 结束后，保存“所有人的通过统计”
-        try:
-            if split_subject_pass_rows:
-                out_dir = getattr(config, 'SQI_REPORT_DIR', './')
-                os.makedirs(out_dir, exist_ok=True)
-                pass_df = pd.DataFrame(split_subject_pass_rows)
-                pass_file = os.path.join(out_dir, f'subject_pass_summary_{split_name}.csv')
-                tmp_pass = pass_file + '.tmp'
-                pass_df.to_csv(tmp_pass, index=False)
-                os.replace(tmp_pass, pass_file)
-                print(f"💾 保存所有人的通过统计: {pass_file}")
-        except Exception as e:
-            logging.debug(f"保存所有人通过统计失败: {e}")
+            for segment in ['seg1', 'seg7']:
+                logging.debug(f"Processing {subject_id} - {segment}")
+                # Pass both moved_data_dir and shift_amount to use consistent shift for both segments
+                result = process_segment_data(subject_folder, segment, moved_data_dir, shift_amount)
+                
+                if result is not None:
+                    ppg_data, bp_data, sensor_mask = result
+                    # 使用新的从波谷开始的切片方法，传入subject_folder和segment用于加载HR
+                    ppg_slices, bp_slices, mask_slices = create_slices_from_valleys(
+                        ppg_data, bp_data, sensor_mask, subject_folder, segment
+                    )
+                    
+                    if ppg_slices:
+                        # Add to combined dataset (existing logic)
+                        all_ppg_for_split.extend(ppg_slices)
+                        all_bp_for_split.extend(bp_slices)
+                        all_masks_for_split.extend(mask_slices)
+                        
+                        # Add to segment-specific datasets
+                        if segment == 'seg1':
+                            seg1_ppg_for_split.extend(ppg_slices)
+                            seg1_bp_for_split.extend(bp_slices)
+                            seg1_masks_for_split.extend(mask_slices)
+                        elif segment == 'seg7':
+                            seg7_ppg_for_split.extend(ppg_slices)
+                            seg7_bp_for_split.extend(bp_slices)
+                            seg7_masks_for_split.extend(mask_slices)
+                        
+                        logging.debug(f"Generated {len(ppg_slices)} valley-based slices from {segment}")
+                    else:
+                        logging.debug(f"No valid slices from {segment}")
+                else:
+                    logging.debug(f"No data processed for {segment}")
 
-        # 保存split级数据
+        # Save combined dataset (existing logic)
         if not all_ppg_for_split:
             logging.debug(f"No data generated for {split_name} set.")
             continue
@@ -1725,18 +822,15 @@ def main():
         all_ppg_np = np.array(all_ppg_for_split, dtype=np.float32)
         all_bp_np = np.array(all_bp_for_split, dtype=np.float32)
         all_masks_np = np.array(all_masks_for_split, dtype=bool)
-
+        
         logging.debug(f"Generated {len(all_ppg_np)} samples for {split_name} set (combined)")
         logging.debug(f"PPG shape: {all_ppg_np.shape}, BP shape: {all_bp_np.shape}, Mask shape: {all_masks_np.shape}")
-
+        
         # 统计传感器可用率
-        try:
-            sensor_availability = np.mean(all_masks_np, axis=0)
-            for i, sensor in enumerate(config.SENSORS_TO_USE):
-                logging.debug(f"  {sensor} availability: {sensor_availability[i]*100:.1f}%")
-        except Exception:
-            pass
-
+        sensor_availability = np.mean(all_masks_np, axis=0)
+        for i, sensor in enumerate(config.SENSORS_TO_USE):
+            logging.debug(f"  {sensor} availability: {sensor_availability[i]*100:.1f}%")
+        
         save_path_npz = os.path.join(config.PROCESSED_DATA_DIR, f"{split_name}_data.npz")
         np.savez(save_path_npz, ppg=all_ppg_np, bp=all_bp_np, sensor_mask=all_masks_np)
         logging.debug(f"Saved combined dataset to {save_path_npz}")
@@ -1746,42 +840,52 @@ def main():
             seg1_ppg_np = np.array(seg1_ppg_for_split, dtype=np.float32)
             seg1_bp_np = np.array(seg1_bp_for_split, dtype=np.float32)
             seg1_masks_np = np.array(seg1_masks_for_split, dtype=bool)
+            
+            logging.debug(f"Generated {len(seg1_ppg_np)} samples for {split_name} set (seg1 only)")
+            
             seg1_save_path = os.path.join(config.PROCESSED_DATA_DIR, f"{split_name}_seg1_data.npz")
             np.savez(seg1_save_path, ppg=seg1_ppg_np, bp=seg1_bp_np, sensor_mask=seg1_masks_np)
             logging.debug(f"Saved seg1 dataset to {seg1_save_path}")
-
+        
         # Save seg7-only dataset
         if seg7_ppg_for_split:
             seg7_ppg_np = np.array(seg7_ppg_for_split, dtype=np.float32)
             seg7_bp_np = np.array(seg7_bp_for_split, dtype=np.float32)
             seg7_masks_np = np.array(seg7_masks_for_split, dtype=bool)
+            
+            logging.debug(f"Generated {len(seg7_ppg_np)} samples for {split_name} set (seg7 only)")
+            
             seg7_save_path = os.path.join(config.PROCESSED_DATA_DIR, f"{split_name}_seg7_data.npz")
             np.savez(seg7_save_path, ppg=seg7_ppg_np, bp=seg7_bp_np, sensor_mask=seg7_masks_np)
             logging.debug(f"Saved seg7 dataset to {seg7_save_path}")
 
-        # 保存少量CSV样本
-        try:
-            NUM_SAMPLES_TO_SAVE = 5
-            csv_sample_dir = os.path.join(config.RESULTS_DIR, f"{split_name}_csv_samples")
-            os.makedirs(csv_sample_dir, exist_ok=True)
-            num_total_samples = len(all_ppg_np)
-            sample_indices = np.random.choice(num_total_samples, size=min(NUM_SAMPLES_TO_SAVE, num_total_samples), replace=False)
-            for i, idx in enumerate(sample_indices):
-                ppg_sample = all_ppg_np[idx]
-                mask_sample = all_masks_np[idx]
-                ppg_df = pd.DataFrame(ppg_sample.T, columns=[f'{s}_ir' for s in config.SENSORS_TO_USE])
-                ppg_df.to_csv(os.path.join(csv_sample_dir, f"sample_{i}_ppg.csv"), index=False)
-                mask_df = pd.DataFrame({
-                    'sensor': config.SENSORS_TO_USE,
-                    'available': mask_sample,
-                    'active_sensors': [s if mask_sample[j] else 'MISSING' for j, s in enumerate(config.SENSORS_TO_USE)]
-                })
-                mask_df.to_csv(os.path.join(csv_sample_dir, f"sample_{i}_mask.csv"), index=False)
-                bp_sample = all_bp_np[idx]
-                bp_df = pd.DataFrame(bp_sample, columns=['bp'])
-                bp_df.to_csv(os.path.join(csv_sample_dir, f"sample_{i}_bp.csv"), index=False)
-        except Exception:
-            pass
+        NUM_SAMPLES_TO_SAVE = 5
+        csv_sample_dir = os.path.join(config.PROCESSED_DATA_DIR, f"{split_name}_csv_samples")
+        os.makedirs(csv_sample_dir, exist_ok=True)
+        
+        num_total_samples = len(all_ppg_np)
+        sample_indices = np.random.choice(num_total_samples, size=min(NUM_SAMPLES_TO_SAVE, num_total_samples), replace=False)
+        
+        for i, idx in enumerate(sample_indices):
+            ppg_sample = all_ppg_np[idx]
+            mask_sample = all_masks_np[idx]
+            
+            # 只保存有效传感器的数据
+            active_sensors = [config.SENSORS_TO_USE[j] for j in range(len(config.SENSORS_TO_USE)) if mask_sample[j]]
+            ppg_df = pd.DataFrame(ppg_sample.T, columns=[f'{s}_ir' for s in config.SENSORS_TO_USE])
+            ppg_df.to_csv(os.path.join(csv_sample_dir, f"sample_{i}_ppg.csv"), index=False)
+            
+            # 保存传感器掩码信息
+            mask_df = pd.DataFrame({
+                'sensor': config.SENSORS_TO_USE,
+                'available': mask_sample,
+                'active_sensors': [s if mask_sample[j] else 'MISSING' for j, s in enumerate(config.SENSORS_TO_USE)]
+            })
+            mask_df.to_csv(os.path.join(csv_sample_dir, f"sample_{i}_mask.csv"), index=False)
+            
+            bp_sample = all_bp_np[idx]
+            bp_df = pd.DataFrame(bp_sample, columns=['bp'])
+            bp_df.to_csv(os.path.join(csv_sample_dir, f"sample_{i}_bp.csv"), index=False)
     
     logging.debug(f"All calibrated BP data saved to: {moved_data_dir}")
     print(f"\nCalibrated BP data saved to: {moved_data_dir}")
@@ -1815,8 +919,6 @@ def main():
         seg7_path = os.path.join(config.PROCESSED_DATA_DIR, f"{split_name}_seg7_data.npz")
         if os.path.exists(seg7_path):
             print(f"  {split_name}_seg7_data.npz (seg7 only)")
-
-    # SQI 报告在并行改造后默认关闭；如需保留，可在 worker 级别累积并返回。
 
 if __name__ == "__main__":
     main()

@@ -58,6 +58,10 @@ BP_FILTER_HIGH = 3
 PPG_FILTER_LOW = 0.5  
 PPG_FILTER_HIGH = 3.0 
 
+# -------- Input normalization options --------
+PPG_NORM_MODE = 'zscore'     # 'none' | 'zscore'（按窗口逐通道标准化）
+PPG_NORM_EPS = 1e-6          # 防止除零的小常数
+
 OMRON_CSV_PATH = "./data/omron.csv" 
 BP_CORRECTION_THRESHOLD = 10 
 PULSE_PRESSURE_DIFF_THRESHOLD = 10.0
@@ -96,3 +100,7 @@ HR_MAX_BPM = 200
 HR_TOLERANCE_BPM = 5                # |HR_peak - HR_fft| <= tolerance -> valid
 PEAK_MIN_COUNT = 3                  # minimal peaks within a window to trust HR
 SQI_SUBJECT_OVERVIEW = True         # render per-subject best/worst window figure
+
+# -------- Training-time SQI export (debug) --------
+SQI_DUMP_CSV = False                # 训练/验证时导出每样本的 HR_td/HR_fd/Δ/权重 明细
+SQI_DUMP_MAX_SAMPLES = 2000         # 每个 split 每个 epoch 最多导出的样本数，避免过大文件
