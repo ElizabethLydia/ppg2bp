@@ -14,6 +14,8 @@ from loss.trend_loss import CombinedBPAttentionLoss
 
 # Reproducibility utilities
 import random
+import json
+import subprocess
 
 def set_seed(seed: int):
     os.environ["PYTHONHASHSEED"] = str(seed)
@@ -44,6 +46,16 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device):
         
         optimizer.zero_grad()
         
+        # If model expects multiple input channels but dataset is single-channel,
+        # expand channels by repeating along channel dim to avoid changing model.
+        try:
+            expected_in = getattr(model, 'in_channels', None)
+        except Exception:
+            expected_in = None
+        if expected_in is not None and ppg.dim() == 3 and ppg.size(1) != expected_in:
+            # repeat channels to match expected_in
+            if ppg.size(1) == 1 and expected_in > 1:
+                ppg = ppg.repeat(1, expected_in, 1)
         predictions = model(ppg, sensor_mask)
         
         # --- MODIFICATION: Unpack new loss and details dictionary ---
@@ -92,7 +104,16 @@ def validate_one_epoch(model, dataloader, criterion, device):
                 ppg, bp = batch_data
                 ppg, bp = ppg.to(device), bp.to(device)
                 sensor_mask = None
-                
+
+            # Same channel-expansion logic as in training loop
+            try:
+                expected_in = getattr(model, 'in_channels', None)
+            except Exception:
+                expected_in = None
+            if expected_in is not None and ppg.dim() == 3 and ppg.size(1) != expected_in:
+                if ppg.size(1) == 1 and expected_in > 1:
+                    ppg = ppg.repeat(1, expected_in, 1)
+
             predictions = model(ppg, sensor_mask)
             
             # --- MODIFICATION: Unpack new loss and details dictionary ---
@@ -153,6 +174,47 @@ def main():
                            num_workers=4, pin_memory=True, drop_last=False, worker_init_fn=_worker_init_fn)
     print(f"Train samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
 
+    # Create a per-mode runs folder (single-channel vs multi-channel) and a
+    # per-run subfolder so all artifacts (models, plots) go under runs/<mode>/<run_tag>/
+    from datetime import datetime as _dt
+    mode_root = 'single-channel' if getattr(config, 'SINGLE_SENSOR_MODE', False) else 'multi-channel'
+    base_run_root = os.path.join('runs', mode_root)
+    run_tag = _dt.now().strftime('%Y%m%d_%H%M%S')
+    run_results_dir = os.path.join(base_run_root, run_tag)
+    os.makedirs(run_results_dir, exist_ok=True)
+    print(f"Outputs for this run will be written to {run_results_dir}")
+
+    # write meta for traceability
+    try:
+        git_commit = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], cwd=os.getcwd(), text=True).strip()
+    except Exception:
+        git_commit = None
+    try:
+        git_branch = subprocess.check_output(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=os.getcwd(), text=True).strip()
+    except Exception:
+        git_branch = None
+    meta = {
+        'timestamp': run_tag,
+        'single_sensor_mode': bool(getattr(config, 'SINGLE_SENSOR_MODE', False)),
+        'single_sensor_index': int(getattr(config, 'SINGLE_SENSOR_INDEX', 0)),
+        'single_sensor_name': (config.SENSORS_TO_USE[config.SINGLE_SENSOR_INDEX]
+                               if getattr(config, 'SINGLE_SENSOR_MODE', False) and
+                                  0 <= getattr(config, 'SINGLE_SENSOR_INDEX', 0) < len(config.SENSORS_TO_USE)
+                               else None),
+        'git_commit': git_commit,
+        'git_branch': git_branch,
+    }
+    try:
+        with open(os.path.join(run_results_dir, 'meta.json'), 'w', encoding='utf-8') as fh:
+            json.dump(meta, fh, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+    # Print clear run info for user
+    mode_str = 'SINGLE' if meta['single_sensor_mode'] else 'MULTI'
+    print(f"Run mode: {mode_str}")
+    print(f"Sensor index: {meta['single_sensor_index']}, sensor name: {meta['single_sensor_name']}")
+    print(f"Artifacts will be stored under: {run_results_dir}")
+
     print(f"Initializing model on device: {config.DEVICE}")
     model = UNet1D(in_channels=config.IN_CHANNELS, output_points=config.OUTPUT_POINTS, dropout_rate=0.2).to(config.DEVICE)
     
@@ -209,8 +271,10 @@ def main():
         val_loss = val_metrics['total_loss']
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            os.makedirs(config.SAVED_MODELS_DIR, exist_ok=True)
-            model_path = os.path.join(config.SAVED_MODELS_DIR, "best_model.pth")
+            # Always save to the run directory (no fallback to global)
+            save_dir = run_results_dir
+            os.makedirs(save_dir, exist_ok=True)
+            model_path = os.path.join(save_dir, "best_model.pth")
             torch.save({'epoch': epoch, 'model_state_dict': model.state_dict(), 'best_val_loss': best_val_loss}, model_path)
             print(f"  Validation loss improved. Saved new best model to {model_path}")
             epochs_no_improve = 0
@@ -220,8 +284,10 @@ def main():
 
         # NEW: Save model at every 5th epoch (5, 10, 15, 20, etc.)
         if (epoch + 1) % 5 == 0:
-            os.makedirs(config.SAVED_MODELS_DIR, exist_ok=True)
-            epoch_model_path = os.path.join(config.SAVED_MODELS_DIR, f"model_epoch_{epoch+1}.pth")
+            # Always save epoch models to run directory
+            save_dir = run_results_dir
+            os.makedirs(save_dir, exist_ok=True)
+            epoch_model_path = os.path.join(save_dir, f"model_epoch_{epoch+1}.pth")
             torch.save({
                 'epoch': epoch, 
                 'model_state_dict': model.state_dict(), 
@@ -241,9 +307,9 @@ def main():
     print("Plotting and saving learning curves...")
     try:
         import matplotlib.pyplot as plt
-        
+
         epochs = range(1, len(train_metrics_history) + 1)
-        
+
         # Plot 1: Total Loss Curve (remains the same)
         plt.figure(figsize=(12, 6))
         plt.plot(epochs, [m['total_loss'] for m in train_metrics_history], label='Training Total Loss')
@@ -254,33 +320,35 @@ def main():
             best_epoch = np.argmin([m['total_loss'] for m in val_metrics_history]) + 1
             plt.axvline(best_epoch, color='r', linestyle='--', alpha=0.7, label=f'Best Val Loss (Epoch {best_epoch})')
         plt.legend(); plt.grid(True, alpha=0.3)
-        os.makedirs(config.RESULTS_DIR, exist_ok=True)
-        plt.savefig(os.path.join(config.RESULTS_DIR, "loss_curve.png"), dpi=300)
+
+        results_dir_to_use = run_results_dir if ('run_results_dir' in locals() and run_results_dir is not None) else config.RESULTS_DIR
+        os.makedirs(results_dir_to_use, exist_ok=True)
+        plt.savefig(os.path.join(results_dir_to_use, "loss_curve.png"), dpi=300)
         plt.close()
         print("Total loss curve saved.")
 
         # --- MODIFICATION: Plot 2 visualizes the new loss components ---
         plt.figure(figsize=(14, 8))
-        
+
         # SBP/DBP Loss
         plt.plot(epochs, [m['sbp_dbp_loss'] for m in train_metrics_history], label='Train SBP/DBP Loss', color='blue', linestyle='-')
         plt.plot(epochs, [m['sbp_dbp_loss'] for m in val_metrics_history], label='Validation SBP/DBP Loss', color='blue', linestyle='--')
-        
+
         # Trend Loss
         plt.plot(epochs, [m['trend_loss'] for m in train_metrics_history], label='Train Trend Loss', color='green', linestyle='-')
         plt.plot(epochs, [m['trend_loss'] for m in val_metrics_history], label='Validation Trend Loss', color='green', linestyle='--')
-        
+
         # Notch Loss
         plt.plot(epochs, [m['notch_loss'] for m in train_metrics_history], label='Train Notch Loss', color='red', linestyle='-')
         plt.plot(epochs, [m['notch_loss'] for m in val_metrics_history], label='Validation Notch Loss', color='red', linestyle='--')
-        
+
         plt.title('All Loss Components Over Epochs')
         plt.xlabel('Epoch'); plt.ylabel('Loss Value')
         plt.legend(loc='upper right'); plt.grid(True, alpha=0.5)
         plt.yscale('log')
         plt.suptitle('Note: Y-axis is in log scale to show all components clearly', fontsize=10, y=0.92)
 
-        plt.savefig(os.path.join(config.RESULTS_DIR, "loss_components_curve.png"), dpi=300)
+        plt.savefig(os.path.join(results_dir_to_use, "loss_components_curve.png"), dpi=300)
         plt.close()
         print("Loss components curve saved.")
 

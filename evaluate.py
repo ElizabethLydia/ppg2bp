@@ -150,7 +150,17 @@ def evaluate_model_on_dataset(model, dataset, device):
                 ppg_sample, bp_true = sample_data
                 ppg_input = ppg_sample.unsqueeze(0).to(device)
                 sensor_mask_input = None
-            
+
+            # If model expects multiple input channels but dataset is single-channel,
+            # expand channels by repeating along channel dim (non-intrusive fix).
+            try:
+                expected_in = getattr(model, 'in_channels', None)
+            except Exception:
+                expected_in = None
+            if expected_in is not None and ppg_input.dim() == 3 and ppg_input.size(1) != expected_in:
+                if ppg_input.size(1) == 1 and expected_in > 1:
+                    ppg_input = ppg_input.repeat(1, expected_in, 1)
+
             bp_pred = model(ppg_input, sensor_mask_input)
             
             bp_true_np = bp_true.squeeze().cpu().numpy()
@@ -202,7 +212,16 @@ def evaluate_and_plot(model, device, model_name, num_samples=5):
                 ppg_sample, bp_true = sample_data
                 ppg_input = ppg_sample.unsqueeze(0).to(device)
                 sensor_mask_input = None
-            
+
+            # Same channel-expansion logic as above to handle single-channel inputs
+            try:
+                expected_in = getattr(model, 'in_channels', None)
+            except Exception:
+                expected_in = None
+            if expected_in is not None and ppg_input.dim() == 3 and ppg_input.size(1) != expected_in:
+                if ppg_input.size(1) == 1 and expected_in > 1:
+                    ppg_input = ppg_input.repeat(1, expected_in, 1)
+
             bp_pred = model(ppg_input, sensor_mask_input)
             
             bp_true_np = bp_true.squeeze().cpu().numpy()
@@ -264,22 +283,33 @@ def main():
     
     # NEW: Find all available model files
     model_files = []
-    
-    # Add best model
-    best_model_path = os.path.join(config.SAVED_MODELS_DIR, "best_model.pth")
-    if os.path.exists(best_model_path):
-        model_files.append(("best_model", best_model_path))
-    
-    # Add epoch models (5, 10, 15, etc.)
-    epoch_model_pattern = os.path.join(config.SAVED_MODELS_DIR, "model_epoch_*.pth")
-    epoch_models = glob.glob(epoch_model_pattern)
-    
-    for epoch_model_path in sorted(epoch_models):
-        # Extract epoch number from filename
-        filename = os.path.basename(epoch_model_path)
-        epoch_num = filename.replace("model_epoch_", "").replace(".pth", "")
-        model_name = f"epoch_{epoch_num}"
-        model_files.append((model_name, epoch_model_path))
+
+    # Prefer models saved inside the latest run directory under runs/<mode>/*
+    def find_latest_run_models(mode_root):
+        run_root = os.path.join('runs', mode_root)
+        if not os.path.isdir(run_root):
+            return []
+        runs = sorted([d for d in os.listdir(run_root) if os.path.isdir(os.path.join(run_root, d))], reverse=True)
+        for r in runs:
+            run_dir = os.path.join(run_root, r)
+            cand = []
+            best_p = os.path.join(run_dir, 'best_model.pth')
+            if os.path.exists(best_p):
+                cand.append(("best_model", best_p))
+            cand += sorted([(os.path.basename(p).replace('.pth',''), p)
+                            for p in glob.glob(os.path.join(run_dir, 'model_epoch_*.pth'))])
+            if cand:
+                return cand, run_dir
+        return [], None
+
+    mode_root = 'single-channel' if getattr(config, 'SINGLE_SENSOR_MODE', False) else 'multi-channel'
+    run_models, run_dir = find_latest_run_models(mode_root)
+    if run_models:
+        model_files.extend(run_models)
+        print(f"Using models from latest run dir: {run_dir}")
+    else:
+        # No fallback: require models in runs/<mode>/
+        raise FileNotFoundError(f"No run models found under runs/{mode_root}/. Please run training in that mode first.")
     
     if not model_files:
         print("No model files found in saved_models directory!")
@@ -322,7 +352,21 @@ def main():
         if result is not None:
             avg_metrics, avg_clinical, plot_path = result
             all_results[model_name] = avg_metrics
-            
+            # If we loaded models from a run dir, save the evaluation plot into the same run dir
+            try:
+                # run_dir is set earlier when we found models
+                if 'run_dir' in locals() and run_dir is not None and plot_path is not None:
+                    dest_plot = os.path.join(run_dir, os.path.basename(plot_path))
+                    try:
+                        import shutil
+                        shutil.copy(plot_path, dest_plot)
+                        print(f"Copied evaluation plot to run dir: {dest_plot}")
+                        plot_path = dest_plot
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
             # Log to swanlab with model-specific prefix
             swanlab_metrics = {f"{model_name}/{key}": value for key, value in avg_metrics.items()}
             swanlab.log(swanlab_metrics)

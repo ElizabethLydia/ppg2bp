@@ -94,3 +94,10 @@ HR_MAX_BPM = 200
 HR_TOLERANCE_BPM = 5                # |HR_peak - HR_fft| <= tolerance -> valid
 PEAK_MIN_COUNT = 3                  # minimal peaks within a window to trust HR
 SQI_SUBJECT_OVERVIEW = True         # render per-subject best/worst window figure
+
+# ---------- Single-sensor experiment options (safe defaults keep original behavior) ---------
+# When enabled, dataset will expose only a single PPG channel (C=1) taken from
+# SINGLE_SENSOR_INDEX. This is intended for rapid single-channel baselines and
+# will not change other pipeline behavior unless enabled.
+SINGLE_SENSOR_MODE = True
+SINGLE_SENSOR_INDEX = 0

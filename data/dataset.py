@@ -41,6 +41,23 @@ class PPGDataset(Dataset):
 
             N, C, L = ppg.shape
 
+            # If single-sensor mode enabled in config, select only that channel
+            try:
+                import config as _config
+                if getattr(_config, 'SINGLE_SENSOR_MODE', False):
+                    si = int(getattr(_config, 'SINGLE_SENSOR_INDEX', 0))
+                    if si < 0 or si >= C:
+                        raise IndexError(f"SINGLE_SENSOR_INDEX={si} out of range for C={C}")
+                    # slice to (N,1,L)
+                    ppg = ppg[:, si:si+1, :]
+                    C = 1
+                    if sensor_mask is not None:
+                        # keep mask aligned
+                        sensor_mask = sensor_mask[:, si:si+1]
+            except Exception:
+                # Fail-safe: if config import or attribute missing, continue normally
+                pass
+
             # bp: 统一到 (N, 1, L)
             if bp.ndim == 2:         # (N, L)
                 if bp.shape[1] != L:
